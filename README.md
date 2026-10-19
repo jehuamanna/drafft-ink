@@ -174,6 +174,63 @@ crates/
 
 ---
 
+## Differences from upstream
+
+This fork is based on [PatWie/drafft-ink](https://github.com/PatWie/drafft-ink)
+at `8ce40ab` (2026-07-06), the current upstream `main`. It adds to upstream
+rather than rewriting it: nothing upstream has been merged back, and upstream
+has no newer commits to merge in.
+
+| Measure | Amount |
+|---|---|
+| Commits ahead of upstream | 10 (0 behind) |
+| Files changed | 50: 30 added, 19 modified, 1 removed |
+| Rust code | +8,039 / −1,525 lines, against about 30,500 upstream: roughly a quarter more code, about 5% of upstream's lines changed or removed |
+| Data | +1,826 lines of stroke-font data for the practice sheets |
+| Packaging and docs | `install.sh`, desktop entry, icon, udev rule, this README |
+
+(As of `40f67ef`. To recount: `git diff --shortstat 8ce40ab...main`.)
+
+**New in this fork**
+
+- Graphics tablets on Wayland: pen pressure, tilt, eraser end, barrel
+  buttons, tablet keys, touch ring/strip, dials (read from the device when the
+  compositor doesn't forward them), pinch zoom; pressure curve, stabilizer and
+  hover settings. Applies to Wacom tablets, or any tablet if forced.
+- Smoother freehand strokes (no faceting after release).
+- Brushes: Pen, Pointed nib, Broad nib, Brush pen, Marker, Pencil, Soft brush.
+- Handwriting and calligraphy guide grids, and 19 practice sheets.
+- Configurable keyboard shortcuts, pen buttons, tablet keys and dials
+  (Settings window).
+- Toolbars at the pointer (tools, colours, fill, widths, properties).
+- More stroke widths and a width slider; colour shortcuts.
+- Tabs as documents: per-tab files, Ctrl+S to the same file, unsaved-change
+  markers and prompts, recent files, session restore, New Document.
+- Linux desktop install (`install.sh`) and `--original` to install upstream
+  alongside.
+
+**Changed from upstream behaviour**
+
+- The grid button opens a menu of styles instead of cycling on each click
+  (the shortcut still cycles).
+- Ctrl+S saves to the tab's file instead of always asking; opened files open
+  in their own tab, fitted to view, instead of replacing the current drawing.
+- Closing the last tab leaves an empty one; closing or quitting with unsaved
+  changes asks first.
+- The pen panel's "Normal / Calligraphy" toggle is now "Motion: Direct /
+  Smoothed" (it was a smoothing setting); calligraphy is the Broad nib brush.
+- Ctrl+/− no longer scales the interface; they zoom the canvas only.
+- Overlapping see-through strokes of the same colour no longer darken where
+  they overlap (strokes are drawn in batches for speed).
+- Fixed: opened files not appearing until the pointer moved.
+
+**Compatibility.** Documents stay compatible both ways. Pen strokes gain a
+`brush` and `nib_angle`; upstream ignores them and draws those strokes as
+plain pen strokes, and saving from upstream drops them. Settings this fork
+adds live in `~/.config/drafftink/`, which upstream doesn't read.
+
+---
+
 ## Philosophy
 
 Your tools should work for you. No accounts, no paywalls, no telemetry, no "upgrade to Pro."
