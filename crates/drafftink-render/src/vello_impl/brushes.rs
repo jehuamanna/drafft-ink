@@ -167,6 +167,11 @@ pub(super) fn freehand_layers(
     let color = style.stroke_with_opacity();
     let pressures: Vec<f64> = (0..n).map(|i| freehand.pressure_at(i)).collect();
 
+    if freehand.brush == PenBrush::Dotted {
+        let (points, _) = catmull_rom_resample(&freehand.points, &pressures, 1.0 / detail);
+        return vec![(dotted_outline(&points, sw), color)];
+    }
+
     if freehand.brush == PenBrush::BroadNib {
         // Interpolate a spline through the input so fast strokes don't
         // show facets, then sweep the nib along it.
@@ -356,6 +361,7 @@ pub(super) fn brush_width(
         }
         Brush::Pencil => stroke_width * 1.2 * (0.55 + 0.45 * p),
         Brush::Soft => pressure_width(stroke_width * 1.8, p),
+        Brush::Dotted => stroke_width,
     }
 }
 
@@ -428,6 +434,31 @@ pub(super) fn convex_hull(mut points: Vec<Point>) -> Vec<Point> {
 }
 
 /// Total length of a polyline.
+/// Evenly spaced round dots along a polyline, from end to end.
+fn dotted_outline(points: &[Point], stroke_width: f64) -> BezPath {
+    let radius = (stroke_width * 0.75).max(0.5);
+    let spacing = radius * 2.0 + (radius * 2.5).max(3.5);
+    let length = polyline_length(points);
+    let count = (length / spacing).ceil().max(1.0) as usize;
+    let mut path = BezPath::new();
+    let mut segment = 0;
+    let mut segment_start = 0.0;
+    for i in 0..=count {
+        let at = length * i as f64 / count as f64;
+        // Walk to the segment containing `at`.
+        while segment + 2 < points.len()
+            && segment_start + points[segment].distance(points[segment + 1]) < at
+        {
+            segment_start += points[segment].distance(points[segment + 1]);
+            segment += 1;
+        }
+        let (a, b) = (points[segment], points[segment + 1]);
+        let t = ((at - segment_start) / a.distance(b).max(f64::EPSILON)).clamp(0.0, 1.0);
+        path.extend(kurbo::Circle::new(a.lerp(b, t), radius).path_elements(0.1));
+    }
+    path
+}
+
 pub(super) fn polyline_length(points: &[Point]) -> f64 {
     points.windows(2).map(|w| w[0].distance(w[1])).sum()
 }

@@ -22,9 +22,13 @@ pub enum Brush {
     Pencil,
     /// Soft airbrush-like edges.
     Soft,
+    /// Round dots along the stroke, for letters to trace over (practice
+    /// sheets). Not offered as a pen brush.
+    Dotted,
 }
 
 impl Brush {
+    /// The pen brushes, as offered in the pen panel.
     pub const ALL: [Brush; 7] = [
         Brush::Pen,
         Brush::PointedNib,
@@ -33,6 +37,18 @@ impl Brush {
         Brush::Marker,
         Brush::Pencil,
         Brush::Soft,
+    ];
+
+    /// Every brush in storage order.
+    const STORED: [Brush; 8] = [
+        Brush::Pen,
+        Brush::PointedNib,
+        Brush::BroadNib,
+        Brush::BrushPen,
+        Brush::Marker,
+        Brush::Pencil,
+        Brush::Soft,
+        Brush::Dotted,
     ];
 
     pub fn name(self) -> &'static str {
@@ -44,6 +60,7 @@ impl Brush {
             Brush::Marker => "Marker",
             Brush::Pencil => "Pencil",
             Brush::Soft => "Soft brush",
+            Brush::Dotted => "Dotted",
         }
     }
 
@@ -60,18 +77,19 @@ impl Brush {
             Brush::Marker => "Even width regardless of pressure",
             Brush::Pencil => "Light, grainy graphite for sketching",
             Brush::Soft => "Soft-edged strokes for shading",
+            Brush::Dotted => "Dots to trace over",
         }
     }
 
     /// Stable number for storage.
     pub fn to_index(self) -> i64 {
-        Self::ALL.iter().position(|&b| b == self).unwrap_or(0) as i64
+        Self::STORED.iter().position(|&b| b == self).unwrap_or(0) as i64
     }
 
     pub fn from_index(index: i64) -> Self {
         usize::try_from(index)
             .ok()
-            .and_then(|i| Self::ALL.get(i).copied())
+            .and_then(|i| Self::STORED.get(i).copied())
             .unwrap_or_default()
     }
 }
@@ -101,7 +119,7 @@ mod tests {
 
     #[test]
     fn test_brush_index_round_trip() {
-        for brush in Brush::ALL {
+        for brush in Brush::STORED {
             assert_eq!(Brush::from_index(brush.to_index()), brush);
         }
         assert_eq!(Brush::from_index(99), Brush::Pen);

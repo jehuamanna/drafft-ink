@@ -112,8 +112,8 @@ recent files, and the tabs open when you quit come back on the next start.
 
 **Menu → Handwriting practice ›** and **Calligraphy practice ›** open practice
 sheets in their own tab: every uppercase and lowercase letter, number and symbol
-in a lettering style, on matching guide lines, each line followed by an empty
-row to write it yourself.
+in a lettering style, on matching guide lines. Each line is followed by the
+same letters dotted, to trace over, and then an empty row to write it yourself.
 
 - Handwriting: Print, Slanted print, Clean print, Clean italic print, Casual
   hand, Typewriter print, School cursive, Serif print (trace)
@@ -121,8 +121,8 @@ row to write it yourself.
   (italic hand), Italic, Decorative, Blackletter, Fraktur, Rotunda, Formal
   script and Italic (the last five to trace)
 
-Most styles show every brush at every stroke width; "trace" styles are grey
-outlines to trace with any brush. Letters come from the Hershey and EMS
+Most styles show every brush at every stroke width; "trace" styles show
+outlined letters, to trace and copy with any brush. Letters come from the Hershey and EMS
 single-line fonts (credits and licences in `crates/drafftink-core/assets/practice`).
 
 Settings are saved in `~/.config/drafftink/` (`keybindings.json`, `tablet.json`,

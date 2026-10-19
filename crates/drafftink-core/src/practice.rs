@@ -1,7 +1,8 @@
 //! Practice sheets: every letter, number and symbol in a handwriting or
-//! calligraphy style, on matching guide lines, with an empty row after each
-//! line to copy it. Most styles show each brush at each stroke width; the
-//! outlined styles are grey letters to trace with any brush.
+//! calligraphy style, on matching guide lines. Each line is followed by the
+//! same letters dotted to trace over, then an empty row to copy it. Most
+//! styles show each brush at each stroke width; the outlined styles show one
+//! block to trace with any brush.
 //!
 //! Letters come from single-line stroke fonts (see `assets/practice`), drawn
 //! as pen strokes so every brush renders them as it would your writing.
@@ -31,8 +32,8 @@ impl SheetKind {
 enum Mode {
     /// Every brush at every stroke width.
     Brushes,
-    /// The letters are drawn as outlines (double lines): one block of grey
-    /// letters to trace over.
+    /// The letters are drawn as outlines (double lines): one block to trace
+    /// with any brush.
     Trace,
 }
 
@@ -221,9 +222,11 @@ const LOWERCASE: &str = "abcdefghijklmnopqrstuvwxyz";
 const NUMBERS: &str = "0123456789";
 const SYMBOLS: &str = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 
-/// Rows of each block: the title, then each character line followed by an
-/// empty practice row, then a spacer.
-const BLOCK_ROWS: usize = 10;
+/// Rows per character line: the letters, dotted letters to trace, and an
+/// empty row to write them.
+const LINE_ROWS: usize = 3;
+/// Rows of each block: the title, the four character lines, then a spacer.
+const BLOCK_ROWS: usize = 2 + 4 * LINE_ROWS;
 /// Rows above the first block for the sheet title and instructions.
 const HEADER_ROWS: usize = 3;
 
@@ -233,7 +236,7 @@ const INK: SerializableColor = SerializableColor {
     b: 59,
     a: 255,
 };
-/// Letters to trace over: light enough that your own strokes stand out.
+/// Dotted letters to trace over: light enough that your own strokes stand out.
 const TRACE: SerializableColor = SerializableColor {
     r: 148,
     g: 163,
@@ -342,12 +345,13 @@ impl PracticeSheet {
         let instructions = match self.style().mode {
             Mode::Brushes => {
                 "Each block is one brush (down) at one stroke width (across): uppercase, \
-                 lowercase, numbers and symbols,\neach with an empty row below to write it \
-                 yourself. Pick the same brush and width in the pen panel and copy along the lines."
+                 lowercase, numbers and symbols. Below each line, trace over the dotted letters,\n\
+                 then write it yourself in the empty row. Pick the same brush and width in the \
+                 pen panel."
             }
             Mode::Trace => {
-                "Trace over the grey letters with any brush, then write each line yourself in \
-                 the empty row below it."
+                "Below each line, trace over the dotted letters with any brush, then write it \
+                 yourself in the empty row."
             }
         };
         add_text(&mut doc, left, row * 2.0, x_height * 0.5, instructions);
@@ -357,7 +361,7 @@ impl PracticeSheet {
                 .into_iter()
                 .flat_map(|brush| WIDTHS.into_iter().map(move |w| (brush, w, INK)))
                 .collect(),
-            Mode::Trace => vec![(Brush::Pen, 1.0, TRACE)],
+            Mode::Trace => vec![(Brush::Pen, 1.0, INK)],
         };
         for (i, &(brush, width, color)) in blocks.iter().enumerate() {
             let (down, across) = match self.style().mode {
@@ -384,26 +388,36 @@ impl PracticeSheet {
                 ("Symbols", SYMBOLS),
             ];
             for (l, (name, text)) in lines.into_iter().enumerate() {
-                let base = baseline(1 + l * 2);
+                let base = baseline(1 + l * LINE_ROWS);
                 add_text(&mut doc, x0, base, x_height * 0.4, name);
-                let mut cursor = x0 + label_width;
-                for c in text.chars() {
-                    let Some(g) = font.glyph(c) else {
-                        continue;
-                    };
-                    for stroke in &g.strokes {
-                        let points: Vec<Point> = stroke
-                            .iter()
-                            .map(|p| {
-                                // Font y is up from the baseline.
-                                Point::new(cursor + (p.x + p.y * shear) * scale, base - p.y * scale)
-                            })
-                            .collect();
-                        if let Some(shape) = pen_stroke(&points, brush, width, color) {
-                            doc.add_shape(shape);
+                // The letters, then the same letters dotted on the next row.
+                let rows = [
+                    (base, brush, width, color),
+                    (base + row, Brush::Dotted, 1.5, TRACE),
+                ];
+                for (base, brush, width, color) in rows {
+                    let mut cursor = x0 + label_width;
+                    for c in text.chars() {
+                        let Some(g) = font.glyph(c) else {
+                            continue;
+                        };
+                        for stroke in &g.strokes {
+                            let points: Vec<Point> = stroke
+                                .iter()
+                                .map(|p| {
+                                    // Font y is up from the baseline.
+                                    Point::new(
+                                        cursor + (p.x + p.y * shear) * scale,
+                                        base - p.y * scale,
+                                    )
+                                })
+                                .collect();
+                            if let Some(shape) = pen_stroke(&points, brush, width, color) {
+                                doc.add_shape(shape);
+                            }
                         }
+                        cursor += g.advance * scale + spacing;
                     }
-                    cursor += g.advance * scale + spacing;
                 }
             }
         }
@@ -619,6 +633,26 @@ mod tests {
                         .any(|f| f.brush == brush && f.style.stroke_width == width)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_every_sheet_has_dotted_letters_to_trace() {
+        for sheet in PracticeSheet::all() {
+            let doc = sheet.build();
+            let (mut solid, mut dotted) = (0, 0);
+            for shape in doc.shapes_ordered() {
+                if let Shape::Freehand(f) = shape {
+                    if f.brush == Brush::Dotted {
+                        dotted += 1;
+                    } else {
+                        solid += 1;
+                    }
+                }
+            }
+            // Every line has a dotted copy.
+            assert!(dotted > 0, "{}", sheet.name());
+            assert_eq!(dotted, solid, "{}", sheet.name());
         }
     }
 
