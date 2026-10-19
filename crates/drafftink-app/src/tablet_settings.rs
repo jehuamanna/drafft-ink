@@ -258,10 +258,12 @@ impl Default for TabletSettings {
             pressure_curve: 1.0,
             pressure_min: 0.0,
             pressure_max: 1.0,
-            pressure_smoothing: 0.6,
+            // Tuned for fast handwriting: little lag, jitter still removed
+            // when slow.
+            pressure_smoothing: 0.3,
             stabilizer: true,
-            stabilizer_min_cutoff: 3.0,
-            stabilizer_speed: 0.03,
+            stabilizer_min_cutoff: 6.0,
+            stabilizer_speed: 0.1,
             tilt_width: 0.0,
             calligraphy: false,
             nib_angle_source: NibAngle::default(),
