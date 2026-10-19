@@ -54,6 +54,10 @@ struct CachedTextLayout {
     height: f64,
 }
 
+/// Pen stroke outlines by shape: (content hash, frame last used, filled layers).
+type FreehandCache =
+    std::collections::HashMap<drafftink_core::shapes::ShapeId, (u64, u64, Vec<(BezPath, Color)>)>;
+
 /// Vello-based renderer for GPU-accelerated 2D graphics.
 pub struct VelloRenderer {
     /// The Vello scene being built.
@@ -74,6 +78,13 @@ pub struct VelloRenderer {
     shape_cache: std::collections::HashMap<(String, u32, u32, u64, i32, u64), BezPath>,
     /// Text layout cache. Key: (shape_id, content_hash)
     text_cache: std::collections::HashMap<(String, u64), CachedTextLayout>,
+    /// Pen stroke outlines by shape: (content hash, frame last used, filled
+    /// layers). Building outlines is the costly part of drawing strokes.
+    freehand_cache: FreehandCache,
+    /// Frames built, for evicting unused cache entries.
+    frame: u64,
+    /// Off while drawing the in-progress stroke, which is new every frame.
+    cache_freehand: bool,
 }
 
 impl Default for VelloRenderer {
@@ -359,6 +370,9 @@ impl VelloRenderer {
             image_cache: std::collections::HashMap::new(),
             shape_cache: std::collections::HashMap::new(),
             text_cache: std::collections::HashMap::new(),
+            freehand_cache: std::collections::HashMap::new(),
+            frame: 0,
+            cache_freehand: true,
         }
     }
 
@@ -714,94 +728,15 @@ impl VelloRenderer {
         freehand: &drafftink_core::shapes::Freehand,
         transform: Affine,
     ) {
-        use drafftink_core::shapes::Brush as PenBrush;
-
-        let n = freehand.points.len();
-        if n < 2 {
-            return;
-        }
-
-        let style = &freehand.style;
-        let sw = style.stroke_width;
-        let color = style.stroke_with_opacity();
-        let pressures: Vec<f64> = (0..n).map(|i| freehand.pressure_at(i)).collect();
-
-        if freehand.brush == PenBrush::BroadNib {
-            // Interpolate a spline through the input so fast strokes don't
-            // show facets, then sweep the nib along it.
-            let (points, pressures) = catmull_rom_resample(&freehand.points, &pressures, 1.0);
-            let path = broad_nib_outline(&points, &pressures, sw, freehand.nib_angle);
-            self.scene
-                .fill(Fill::NonZero, transform, color, None, &path);
-            return;
-        }
-
-        // A single outline pinches or notches at sharp turns (v, n, w), so
-        // each section between them becomes its own round-capped piece.
-        let reach = (sw * 2.3).max(4.0);
-        let mut sections = Vec::new();
-        let mut start = 0;
-        for end in sharp_corners(&freehand.points, reach)
-            .into_iter()
-            .chain([n - 1])
-        {
-            // Input points can be far apart on fast strokes; interpolate a
-            // spline through them so curves don't render as facets.
-            sections.push(catmull_rom_resample(
-                &freehand.points[start..=end],
-                &pressures[start..=end],
-                1.5,
-            ));
-            start = end;
-        }
-        let total_length: f64 = sections
-            .iter()
-            .map(|(points, _)| polyline_length(points))
-            .sum();
-
-        // Width of each sample, from the brush.
-        let widths: Vec<Vec<f64>> = {
-            let mut travelled = 0.0;
-            sections
-                .iter()
-                .map(|(points, pressures)| {
-                    let directions = smoothed_directions(points, 3);
-                    (0..points.len())
-                        .map(|i| {
-                            if i > 0 {
-                                travelled += points[i].distance(points[i - 1]);
-                            }
-                            let ends = travelled.min(total_length - travelled);
-                            brush_width(freehand.brush, sw, pressures[i], directions[i], ends)
-                        })
-                        .collect()
-                })
-                .collect()
+        let layers = if self.cache_freehand {
+            cached_freehand_layers(&mut self.freehand_cache, freehand, self.zoom, self.frame)
+                .to_vec()
+        } else {
+            freehand_layers(freehand, detail_for_zoom(self.zoom))
         };
-
-        // Translucent layers (scale of the width, share of the opacity).
-        // All pieces of one layer wind the same way, so the non-zero fill
-        // unions them without double-blending.
-        let layers: &[(f64, f32)] = match freehand.brush {
-            PenBrush::Soft => &[(1.0, 0.22), (0.8, 0.22), (0.6, 0.22), (0.4, 0.22)],
-            PenBrush::Pencil => &[(1.0, 0.5), (0.7, 0.45)],
-            _ => &[(1.0, 1.0)],
-        };
-        for (layer, &(scale, alpha)) in layers.iter().enumerate() {
-            let mut path = BezPath::new();
-            for ((points, _), widths) in sections.iter().zip(&widths) {
-                let widths: Vec<f64> = widths.iter().map(|w| w * scale).collect();
-                if freehand.brush == PenBrush::Pencil {
-                    // Graphite: each layer wanders slightly off the line.
-                    let points = jitter(points, &widths, layer as f64);
-                    append_stroke_outline(&mut path, &points, &widths);
-                } else {
-                    append_stroke_outline(&mut path, points, &widths);
-                }
-            }
-            let color = color.multiply_alpha(alpha);
+        for (path, color) in &layers {
             self.scene
-                .fill(Fill::NonZero, transform, color, None, &path);
+                .fill(Fill::NonZero, transform, *color, None, path);
         }
     }
 
@@ -1643,6 +1578,14 @@ impl Renderer for VelloRenderer {
         // Clear the scene
         self.scene.reset();
         self.selection_color = ctx.selection_color;
+        self.frame += 1;
+        // Forget outlines of strokes not drawn for a while (deleted, edited,
+        // or long off-screen), checking only now and then.
+        if self.frame % 120 == 0 {
+            let frame = self.frame;
+            self.freehand_cache
+                .retain(|_, (_, used, _)| frame - *used < 600);
+        }
         self.zoom = ctx.canvas.camera.zoom;
 
         let camera_transform = ctx.canvas.camera.transform();
@@ -1675,6 +1618,7 @@ impl Renderer for VelloRenderer {
         );
 
         // Draw all shapes in z-order (skip shape being edited or off-screen)
+        let mut batch: Option<(Color, BezPath)> = None;
         for shape in ctx.canvas.document.shapes_ordered() {
             if ctx.editing_shape_id == Some(shape.id()) {
                 continue;
@@ -1683,13 +1627,59 @@ impl Renderer for VelloRenderer {
             let shape_bounds = shape.bounds().inflate(1.0, 1.0);
             if !shape_bounds.intersect(world_viewport).is_zero_area() {
                 let is_selected = ctx.canvas.is_selected(shape.id());
+                // Runs of same-coloured pen strokes become one fill: far fewer
+                // paths for the GPU when many strokes are on screen. They all
+                // wind the same way, so the non-zero fill draws them as before.
+                if let Shape::Freehand(freehand) = shape {
+                    let layered = !freehand.closed
+                        && (freehand.has_pressure()
+                            || freehand.brush != drafftink_core::shapes::Brush::Pen);
+                    if layered && !is_selected && shape.rotation().abs() <= 0.001 {
+                        let layers = cached_freehand_layers(
+                            &mut self.freehand_cache,
+                            freehand,
+                            self.zoom,
+                            self.frame,
+                        );
+                        for (path, color) in layers {
+                            match &mut batch {
+                                Some((batch_color, batch_path)) if batch_color == color => {
+                                    batch_path.extend(path.iter());
+                                }
+                                _ => {
+                                    if let Some((color, path)) = batch.take() {
+                                        self.scene.fill(
+                                            Fill::NonZero,
+                                            camera_transform,
+                                            color,
+                                            None,
+                                            &path,
+                                        );
+                                    }
+                                    batch = Some((*color, path.clone()));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if let Some((color, path)) = batch.take() {
+                    self.scene
+                        .fill(Fill::NonZero, camera_transform, color, None, &path);
+                }
                 self.render_shape(shape, camera_transform, is_selected);
             }
+        }
+        if let Some((color, path)) = batch.take() {
+            self.scene
+                .fill(Fill::NonZero, camera_transform, color, None, &path);
         }
 
         // Draw preview shape if tool is active
         if let Some(preview) = ctx.canvas.tool_manager.preview_shape() {
+            self.cache_freehand = false;
             self.render_shape(&preview, camera_transform, false);
+            self.cache_freehand = true;
         }
 
         // Draw selection rectangle (marquee)
@@ -2354,7 +2344,13 @@ impl VelloRenderer {
         let mut waists = BezPath::new();
         let mut outers = BezPath::new();
         let mut slants = BezPath::new();
-        let slant = guides.slant.clamp(-60.0, 60.0).to_radians().tan();
+        // Slant lines are one x-height apart; hide them once they'd be a
+        // blur of lines only a few pixels apart.
+        let slant = if x_height * self.zoom >= 8.0 {
+            guides.slant.clamp(-60.0, 60.0).to_radians().tan()
+        } else {
+            0.0
+        };
         for k in first..=last {
             let base = k as f64 * row;
             let waist = base - x_height;
@@ -2764,6 +2760,153 @@ mod tests {
         let ctx = RenderContext::new(&canvas, kurbo::Size::new(800.0, 600.0));
         renderer.build_scene(&ctx);
     }
+}
+
+/// Stroke detail (screen pixels per canvas unit, at most 1) for a zoom
+/// level. Zoomed out, strokes need fewer points to look the same; it changes
+/// in steps of two so cached outlines aren't rebuilt on every zoom change.
+fn detail_for_zoom(zoom: f64) -> f64 {
+    2f64.powf(zoom.log2().round()).min(1.0)
+}
+
+/// Outlines of a freehand stroke from the cache, rebuilt when the stroke (or
+/// the zoom detail) changed since they were made.
+fn cached_freehand_layers<'a>(
+    cache: &'a mut FreehandCache,
+    freehand: &drafftink_core::shapes::Freehand,
+    zoom: f64,
+    frame: u64,
+) -> &'a [(BezPath, Color)] {
+    use std::hash::{Hash, Hasher};
+
+    let detail = detail_for_zoom(zoom);
+    // Hashing a sample of the points keeps this cheap for long strokes;
+    // moving, scaling or erasing changes the endpoints or the count anyway.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let n = freehand.points.len();
+    n.hash(&mut hasher);
+    let stride = (n / 16).max(1);
+    for i in (0..n).step_by(stride).chain(n.checked_sub(1)) {
+        freehand.points[i].x.to_bits().hash(&mut hasher);
+        freehand.points[i].y.to_bits().hash(&mut hasher);
+        freehand.pressure_at(i).to_bits().hash(&mut hasher);
+    }
+    freehand.pressures.len().hash(&mut hasher);
+    freehand.style.stroke_width.to_bits().hash(&mut hasher);
+    freehand.style.opacity.to_bits().hash(&mut hasher);
+    let c = freehand.style.stroke_color;
+    (c.r, c.g, c.b, c.a).hash(&mut hasher);
+    freehand.brush.hash(&mut hasher);
+    freehand.nib_angle.to_bits().hash(&mut hasher);
+    detail.to_bits().hash(&mut hasher);
+    let key = hasher.finish();
+
+    let entry = cache
+        .entry(freehand.id())
+        .or_insert_with(|| (key.wrapping_add(1), frame, Vec::new()));
+    if entry.0 != key {
+        *entry = (key, frame, freehand_layers(freehand, detail));
+    }
+    entry.1 = frame;
+    &entry.2
+}
+
+/// Filled outlines (with their colours) that draw a freehand stroke with its
+/// brush: variable width from pressure, direction and position along it.
+///
+/// `detail` is screen pixels per canvas unit (at most 1): sample spacing
+/// grows as it shrinks, so zoomed-out strokes stay cheap to draw.
+fn freehand_layers(
+    freehand: &drafftink_core::shapes::Freehand,
+    detail: f64,
+) -> Vec<(BezPath, Color)> {
+    use drafftink_core::shapes::Brush as PenBrush;
+
+    let n = freehand.points.len();
+    if n < 2 {
+        return Vec::new();
+    }
+
+    let style = &freehand.style;
+    let sw = style.stroke_width;
+    let color = style.stroke_with_opacity();
+    let pressures: Vec<f64> = (0..n).map(|i| freehand.pressure_at(i)).collect();
+
+    if freehand.brush == PenBrush::BroadNib {
+        // Interpolate a spline through the input so fast strokes don't
+        // show facets, then sweep the nib along it.
+        let (points, pressures) = catmull_rom_resample(&freehand.points, &pressures, 1.0 / detail);
+        let path = broad_nib_outline(&points, &pressures, sw, freehand.nib_angle);
+        return vec![(path, color)];
+    }
+
+    // A single outline pinches or notches at sharp turns (v, n, w), so
+    // each section between them becomes its own round-capped piece.
+    let reach = (sw * 2.3).max(4.0);
+    let mut sections = Vec::new();
+    let mut start = 0;
+    for end in sharp_corners(&freehand.points, reach)
+        .into_iter()
+        .chain([n - 1])
+    {
+        // Input points can be far apart on fast strokes; interpolate a
+        // spline through them so curves don't render as facets.
+        sections.push(catmull_rom_resample(
+            &freehand.points[start..=end],
+            &pressures[start..=end],
+            1.5 / detail,
+        ));
+        start = end;
+    }
+    let total_length: f64 = sections
+        .iter()
+        .map(|(points, _)| polyline_length(points))
+        .sum();
+
+    // Width of each sample, from the brush.
+    let widths: Vec<Vec<f64>> = {
+        let mut travelled = 0.0;
+        sections
+            .iter()
+            .map(|(points, pressures)| {
+                let directions = smoothed_directions(points, 3);
+                (0..points.len())
+                    .map(|i| {
+                        if i > 0 {
+                            travelled += points[i].distance(points[i - 1]);
+                        }
+                        let ends = travelled.min(total_length - travelled);
+                        brush_width(freehand.brush, sw, pressures[i], directions[i], ends)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+
+    // Translucent layers (scale of the width, share of the opacity).
+    // All pieces of one layer wind the same way, so the non-zero fill
+    // unions them without double-blending.
+    let layers: &[(f64, f32)] = match freehand.brush {
+        PenBrush::Soft => &[(1.0, 0.22), (0.8, 0.22), (0.6, 0.22), (0.4, 0.22)],
+        PenBrush::Pencil => &[(1.0, 0.5), (0.7, 0.45)],
+        _ => &[(1.0, 1.0)],
+    };
+    let mut filled = Vec::with_capacity(layers.len());
+    for (layer, &(scale, alpha)) in layers.iter().enumerate() {
+        let mut path = BezPath::new();
+        for ((points, _), widths) in sections.iter().zip(&widths) {
+            let widths: Vec<f64> = widths.iter().map(|w| w * scale).collect();
+            if freehand.brush == PenBrush::Pencil {
+                // Graphite: each layer wanders slightly off the line.
+                let points = jitter(points, &widths, layer as f64);
+                append_stroke_outline(&mut path, &points, &widths);
+            } else {
+                append_stroke_outline(&mut path, points, &widths);
+            }
+        }
+        filled.push((path, color.multiply_alpha(alpha)));
+    }
+    filled
 }
 
 /// Indices of sharp turns (over 90°) in a stroke. Directions are measured

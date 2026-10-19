@@ -542,6 +542,8 @@ pub enum UiAction {
     ClearDocument,
     /// Show intro/welcome screen.
     ShowIntro,
+    /// Open a handwriting or calligraphy practice sheet in its own tab.
+    ShowPractice(drafftink_core::practice::PracticeSheet),
     /// Set sloppiness level for selected shapes.
     SetSloppiness(u8), // 0 = Architect, 1 = Artist, 2 = Cartoonist
     /// Set fill pattern for selected shapes.
@@ -2446,6 +2448,16 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                         if menu_item(ui, "Show Intro", "") {
                             action = Some(UiAction::ShowIntro);
                             ui_state.menu_open = false;
+                        }
+
+                        for sheet in [
+                            drafftink_core::practice::PracticeSheet::Handwriting,
+                            drafftink_core::practice::PracticeSheet::Calligraphy,
+                        ] {
+                            if menu_item(ui, &format!("{} Intro", sheet.title()), "") {
+                                action = Some(UiAction::ShowPractice(sheet));
+                                ui_state.menu_open = false;
+                            }
                         }
 
                         widgets_menu_separator(ui);

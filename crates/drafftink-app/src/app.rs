@@ -3422,6 +3422,7 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             UiAction::SwitchTab(_)
                             | UiAction::CloseTab(_)
+                            | UiAction::ShowPractice(_)
                             | UiAction::LoadLibrary => {
                                 // Tab operations need exclusive access to the
                                 // whole AppState, which the egui closure cannot
@@ -4306,6 +4307,39 @@ impl ApplicationHandler<UserEvent> for App {
                         UiAction::SwitchTab(i) => switch_to_tab(state, i),
                         UiAction::CloseTab(i) => close_tab(state, i),
                         UiAction::LoadLibrary => file_ops::load_excalidrawlib_async(),
+                        UiAction::ShowPractice(sheet) => {
+                            // Its own tab (reused if still open), on the
+                            // guide lines the letters were laid out on.
+                            let title = sheet.title().to_string();
+                            match state.tabs.iter().position(|t| t.name == title) {
+                                Some(index) => switch_to_tab(state, index),
+                                None => {
+                                    let mut doc = sheet.build();
+                                    doc.name = title.clone();
+                                    add_tab(state, title.clone(), doc);
+                                    state.canvas.camera.reset();
+                                }
+                            }
+                            let guides = sheet.guides();
+                            state.ui_state.writing_guides = drafftink_render::WritingGuides {
+                                x_height: guides.x_height,
+                                ascender: guides.ascender,
+                                descender: guides.descender,
+                                row_gap: guides.row_gap,
+                                slant: guides.slant,
+                            };
+                            let style = match sheet {
+                                drafftink_core::practice::PracticeSheet::Handwriting => {
+                                    GridStyle::Handwriting
+                                }
+                                drafftink_core::practice::PracticeSheet::Calligraphy => {
+                                    GridStyle::Calligraphy
+                                }
+                            };
+                            state.config.grid_style = style;
+                            state.ui_state.grid_style = style;
+                            log::info!("Opened {title}");
+                        }
                         _ => {}
                     }
                     state.needs_redraw = true;

@@ -10,6 +10,7 @@ pub mod elbow;
 pub mod excalidraw;
 pub mod input;
 pub mod mermaid;
+pub mod practice;
 pub mod selection;
 pub mod shapes;
 pub mod snap;
