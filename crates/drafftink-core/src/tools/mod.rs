@@ -1,6 +1,6 @@
 //! Tool system for the whiteboard.
 
-use crate::shapes::{Shape, ShapeStyle};
+use crate::shapes::{Brush, DEFAULT_NIB_ANGLE, Shape, ShapeStyle};
 use kurbo::Point;
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +93,10 @@ pub struct ToolManager {
     pub pressure_simulation: bool,
     /// Real pressure from a stylus (0.0-1.0); overrides simulated pressure.
     pub stylus_pressure: Option<f64>,
+    /// Brush for new pen strokes.
+    pub brush: Brush,
+    /// Broad nib angle for new pen strokes, in degrees from horizontal.
+    pub nib_angle: f64,
     /// MSD brush position (mass position).
     msd_pos: Point,
     /// MSD brush velocity.
@@ -114,6 +118,8 @@ impl Default for ToolManager {
             calligraphy_mode: false,
             pressure_simulation: false,
             stylus_pressure: None,
+            brush: Brush::default(),
+            nib_angle: DEFAULT_NIB_ANGLE,
             msd_pos: Point::ZERO,
             msd_vel: Point::ZERO,
         }
@@ -307,6 +313,10 @@ impl ToolManager {
             );
             freehand.style = self.current_style.clone();
             freehand.style.seed = seed;
+            if self.current_tool == ToolKind::Freehand {
+                freehand.brush = self.brush;
+                freehand.nib_angle = self.nib_angle;
+            }
 
             // Apply highlighter-specific style (wider, semi-transparent)
             if self.current_tool == ToolKind::Highlighter {

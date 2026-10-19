@@ -1,10 +1,14 @@
 //! User-configurable pen tablet behaviour.
 //!
-//! These settings apply while a Wacom tablet is connected, or for any tablet
-//! when forced. Otherwise the tablet behaves as a plain pen
-//! ([`TabletSettings::plain`]): raw pressure and position, no extra features.
+//! Button, ExpressKey, dial, ring, strip and pinch mappings apply to any
+//! device. The pen-feel settings (pressure curve, stabilizer, tilt, eraser,
+//! hover) apply while a Wacom tablet is connected, or for any tablet when
+//! forced; otherwise the pen feels plain ([`TabletSettings::plain`]): raw
+//! pressure and position. See [`TabletSettings::effective`].
 
 use drafftink_core::tools::ToolKind;
+
+use crate::keybindings::{COMMAND_GROUPS, Command, tool_label};
 use serde::{Deserialize, Serialize};
 
 /// USB vendor id of Wacom.
@@ -37,44 +41,40 @@ pub enum ButtonAction {
     SwitchTool(ToolKind),
     /// Switch to a tool, or back to the previous one if already active.
     ToggleTool(ToolKind),
-    Undo,
-    Redo,
-    ZoomIn,
-    ZoomOut,
-    ZoomReset,
-    ZoomToFit,
-    NextColor,
-    PreviousColor,
-    Thicker,
-    Thinner,
+    /// Run any command available to keyboard shortcuts.
+    Command(Command),
 }
 
 impl ButtonAction {
-    /// Every choice offered in the settings, in display order.
-    pub fn choices() -> Vec<Self> {
-        let mut choices = vec![Self::None, Self::Pan, Self::RightClick];
-        for tool in CONFIGURABLE_TOOLS {
-            choices.push(Self::HoldTool(tool));
+    /// Every choice offered in the settings, grouped for display.
+    pub fn choice_groups() -> Vec<(&'static str, Vec<Self>)> {
+        let tools = all_tools();
+        let mut groups = vec![
+            ("Mouse", vec![Self::None, Self::Pan, Self::RightClick]),
+            (
+                "Tool while held",
+                tools.iter().map(|&t| Self::HoldTool(t)).collect(),
+            ),
+            (
+                "Switch tool",
+                tools.iter().map(|&t| Self::SwitchTool(t)).collect(),
+            ),
+            (
+                "Toggle tool",
+                tools.iter().map(|&t| Self::ToggleTool(t)).collect(),
+            ),
+        ];
+        for &(group, commands) in COMMAND_GROUPS {
+            let commands: Vec<Self> = commands
+                .iter()
+                .filter(|c| !matches!(c, Command::Tool(_)))
+                .map(|&c| Self::Command(c))
+                .collect();
+            if !commands.is_empty() {
+                groups.push((group, commands));
+            }
         }
-        for tool in CONFIGURABLE_TOOLS {
-            choices.push(Self::SwitchTool(tool));
-        }
-        for tool in CONFIGURABLE_TOOLS {
-            choices.push(Self::ToggleTool(tool));
-        }
-        choices.extend([
-            Self::Undo,
-            Self::Redo,
-            Self::ZoomIn,
-            Self::ZoomOut,
-            Self::ZoomReset,
-            Self::ZoomToFit,
-            Self::NextColor,
-            Self::PreviousColor,
-            Self::Thicker,
-            Self::Thinner,
-        ]);
-        choices
+        groups
     }
 
     pub fn label(self) -> String {
@@ -82,24 +82,28 @@ impl ButtonAction {
             Self::None => "Nothing".into(),
             Self::Pan => "Pan (hold)".into(),
             Self::RightClick => "Right click".into(),
-            Self::HoldTool(tool) => format!("{} (hold)", tool_name(tool)),
-            Self::SwitchTool(tool) => format!("{} (switch)", tool_name(tool)),
-            Self::ToggleTool(tool) => format!("{} (toggle)", tool_name(tool)),
-            Self::Undo => "Undo".into(),
-            Self::Redo => "Redo".into(),
-            Self::ZoomIn => "Zoom in".into(),
-            Self::ZoomOut => "Zoom out".into(),
-            Self::ZoomReset => "Zoom to 100%".into(),
-            Self::ZoomToFit => "Zoom to fit".into(),
-            Self::NextColor => "Next colour".into(),
-            Self::PreviousColor => "Previous colour".into(),
-            Self::Thicker => "Thicker stroke".into(),
-            Self::Thinner => "Thinner stroke".into(),
+            Self::HoldTool(tool) => format!("{} (hold)", tool_label(tool)),
+            Self::SwitchTool(tool) => format!("{} (switch)", tool_label(tool)),
+            Self::ToggleTool(tool) => format!("{} (toggle)", tool_label(tool)),
+            Self::Command(command) => command.label(),
         }
     }
 }
 
-/// What turning the touch ring (or sliding a touch strip) does.
+/// Every tool, in toolbar order.
+fn all_tools() -> Vec<ToolKind> {
+    COMMAND_GROUPS
+        .iter()
+        .flat_map(|(_, commands)| commands.iter())
+        .filter_map(|c| match c {
+            Command::Tool(tool) => Some(*tool),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What turning a dial or touch ring (or sliding a touch strip) does, once
+/// per step. Positive steps are clockwise (or down a strip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RingAction {
     #[default]
@@ -111,10 +115,16 @@ pub enum RingAction {
     ScrollHorizontal,
     /// Step through undo history.
     UndoRedo,
+    /// Run one command per step clockwise and another anticlockwise, e.g.
+    /// nudge right / left.
+    Commands {
+        clockwise: Command,
+        anticlockwise: Command,
+    },
 }
 
 impl RingAction {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::None,
         Self::Zoom,
         Self::StrokeWidth,
@@ -122,6 +132,10 @@ impl RingAction {
         Self::ScrollVertical,
         Self::ScrollHorizontal,
         Self::UndoRedo,
+        Self::Commands {
+            clockwise: Command::NudgeRight,
+            anticlockwise: Command::NudgeLeft,
+        },
     ];
 
     pub fn label(self) -> &'static str {
@@ -133,7 +147,13 @@ impl RingAction {
             Self::ScrollVertical => "Scroll vertically",
             Self::ScrollHorizontal => "Scroll horizontally",
             Self::UndoRedo => "Undo / redo",
+            Self::Commands { .. } => "Commands (per direction)",
         }
+    }
+
+    /// Whether `other` is the same kind of action, ignoring its commands.
+    pub fn same_kind(self, other: Self) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
     }
 }
 
@@ -158,30 +178,6 @@ impl NibAngle {
             Self::TiltDirection => "Tilt direction",
             Self::PenRotation => "Pen rotation (Art Pen)",
         }
-    }
-}
-
-/// Tools offered for button assignments.
-pub const CONFIGURABLE_TOOLS: [ToolKind; 7] = [
-    ToolKind::Select,
-    ToolKind::Pan,
-    ToolKind::Freehand,
-    ToolKind::Highlighter,
-    ToolKind::Eraser,
-    ToolKind::Text,
-    ToolKind::LaserPointer,
-];
-
-fn tool_name(tool: ToolKind) -> &'static str {
-    match tool {
-        ToolKind::Select => "Select",
-        ToolKind::Pan => "Pan tool",
-        ToolKind::Freehand => "Pen",
-        ToolKind::Highlighter => "Highlighter",
-        ToolKind::Eraser => "Eraser",
-        ToolKind::Text => "Text",
-        ToolKind::LaserPointer => "Laser",
-        _ => "Tool",
     }
 }
 
@@ -243,6 +239,12 @@ pub struct TabletSettings {
     pub ring_modes: Vec<RingAction>,
     /// Degrees of ring rotation per step.
     pub ring_step_degrees: f64,
+    /// Action for each dial, by dial number.
+    pub dial_actions: Vec<RingAction>,
+    /// Dial detents (clicks) per step.
+    pub dial_detents_per_step: f64,
+    /// Swap the dials' clockwise and anticlockwise actions.
+    pub dial_reverse: bool,
     /// Touch strip action for each strip mode.
     pub strip_modes: Vec<RingAction>,
     /// Pinch on the tablet's touch surface (or a touchpad) to zoom.
@@ -275,14 +277,14 @@ impl Default for TabletSettings {
                 ButtonAction::HoldTool(ToolKind::Select),
             ],
             pad_buttons: vec![
-                ButtonAction::Undo,
-                ButtonAction::Redo,
+                ButtonAction::Command(Command::Undo),
+                ButtonAction::Command(Command::Redo),
                 ButtonAction::Pan,
                 ButtonAction::HoldTool(ToolKind::Eraser),
                 ButtonAction::ToggleTool(ToolKind::Select),
-                ButtonAction::ZoomToFit,
-                ButtonAction::PreviousColor,
-                ButtonAction::NextColor,
+                ButtonAction::Command(Command::ZoomToFit),
+                ButtonAction::Command(Command::PreviousColor),
+                ButtonAction::Command(Command::NextColor),
             ],
             ring_modes: vec![
                 RingAction::Zoom,
@@ -291,6 +293,9 @@ impl Default for TabletSettings {
                 RingAction::UndoRedo,
             ],
             ring_step_degrees: 15.0,
+            dial_actions: vec![RingAction::Zoom, RingAction::StrokeWidth],
+            dial_detents_per_step: 1.0,
+            dial_reverse: false,
             strip_modes: vec![RingAction::ScrollVertical],
             pinch_zoom: true,
         }
@@ -298,8 +303,8 @@ impl Default for TabletSettings {
 }
 
 impl TabletSettings {
-    /// Behaviour when the settings don't apply: a plain pressure-sensitive pen
-    /// whose lower barrel button pans, and nothing else.
+    /// A plain pressure-sensitive pen whose lower barrel button pans, and
+    /// nothing else.
     pub fn plain() -> Self {
         Self {
             activation: Activation::Off,
@@ -321,9 +326,31 @@ impl TabletSettings {
             ],
             pad_buttons: Vec::new(),
             ring_modes: Vec::new(),
+            dial_actions: Vec::new(),
             strip_modes: Vec::new(),
             pinch_zoom: false,
             ..Self::default()
+        }
+    }
+
+    /// The settings in effect. Button, ExpressKey, dial, ring, strip and
+    /// pinch mappings always apply; the pen-feel settings (pressure,
+    /// stabilizer, tilt, eraser, hover) only when `pen_feel_applies`.
+    pub fn effective(&self, pen_feel_applies: bool) -> Self {
+        if pen_feel_applies {
+            return self.clone();
+        }
+        Self {
+            stylus_buttons: self.stylus_buttons,
+            pad_buttons: self.pad_buttons.clone(),
+            ring_modes: self.ring_modes.clone(),
+            ring_step_degrees: self.ring_step_degrees,
+            dial_actions: self.dial_actions.clone(),
+            dial_detents_per_step: self.dial_detents_per_step,
+            dial_reverse: self.dial_reverse,
+            strip_modes: self.strip_modes.clone(),
+            pinch_zoom: self.pinch_zoom,
+            ..Self::plain()
         }
     }
 

@@ -54,6 +54,13 @@ To update, `git pull` and run `./install.sh` again. To remove everything:
 ./install.sh --uninstall
 ```
 
+To keep the unmodified upstream version alongside, run
+`./install.sh --original` (or `--original <git ref>`). It builds that version
+into `~/.local/share/drafftink-original` and adds a separate
+**DrafftInk (Original)** launcher entry. Both open the same documents; pen
+strokes drawn with a brush other than Pen show as plain pen strokes in the
+original.
+
 <details>
 <summary>Manual install (what the script does)</summary>
 
@@ -71,11 +78,33 @@ The `Exec` path is made absolute because launchers often don't have
 </details>
 
 Graphics tablets (e.g. Wacom) work natively on Wayland, including pen
-pressure, the eraser end, and the barrel buttons. **Menu → Pen Tablet...**
-configures the pressure curve, stabilizer, tilt/calligraphy, pen buttons,
-ExpressKeys, touch ring and pinch zoom. These settings apply while a Wacom
-tablet is connected, or to any tablet if you choose to force them, and are saved
-in `~/.config/drafftink/tablet.json`.
+pressure, the eraser end, and the barrel buttons.
+
+**Menu → Settings...** has three tabs:
+
+- **Keyboard** — rebind any shortcut (click a key to remove it, **+** to add one).
+- **Pen** — pressure curve, stabilizer, tilt/calligraphy, eraser and hover. These
+  apply while a Wacom tablet is connected, or to any tablet if you force them.
+- **Buttons & dials** — pen buttons, tablet keys, dials, touch ring/strip and
+  pinch zoom, for any tablet. Each can run any command; dials and rings can run
+  one command per direction (e.g. nudge left / right).
+
+The pen tool's panel has **brushes** for writing (Pen, Pointed nib for
+copperplate, Broad nib for italic and blackletter) and drawing (Brush pen,
+Marker, Pencil, Soft brush). The grid button includes **Handwriting (3 lines)**
+and **Calligraphy (4 lines)** practice guides, with adjustable x-height,
+ascender and descender, row gap, slant and classic proportions.
+
+Press **Q** (or bind "Tools and colours at pointer" to a pen or tablet button)
+to bring the tools and colours to the pointer: tools to its left, colours above
+it. Tap and click an item, or hold, move onto an item and release.
+
+Settings are saved in `~/.config/drafftink/` (`keybindings.json`, `tablet.json`,
+`preferences.json`).
+
+If your compositor doesn't forward tablet dials (e.g. Hyprland 0.56), DrafftInk
+reads them from the device directly; allow that once with
+`./install.sh --tablet-access` (installs a udev rule for tablet pads only).
 
 #### Other platforms / run without installing
 

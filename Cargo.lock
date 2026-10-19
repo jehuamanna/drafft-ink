@@ -1354,6 +1354,7 @@ dependencies = [
  "peniko",
  "rex",
  "roughr",
+ "serde",
  "thiserror 2.0.17",
  "ttf-parser",
  "vello",

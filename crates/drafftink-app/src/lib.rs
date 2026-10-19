@@ -5,13 +5,15 @@
 
 mod app;
 mod event_handler;
-mod shortcuts;
+mod keybindings;
+mod preferences;
 mod tablet;
+#[cfg(target_os = "linux")]
+mod tablet_evdev;
 mod tablet_settings;
 mod ui;
 
 pub use app::{App, AppConfig};
-pub use shortcuts::{Shortcut, ShortcutRegistry};
 pub use ui::{UiAction, UiState, render_ui};
 
 #[cfg(target_arch = "wasm32")]

@@ -17,6 +17,7 @@ drafftink-core = { path = "../drafftink-core", version = "0.1.0" }
 kurbo.workspace = true
 peniko.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 
 # Image decoding
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

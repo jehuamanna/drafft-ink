@@ -1,0 +1,4 @@
+# Let the logged-in user read graphics tablet pads, so DrafftInk can use pad
+# dials that the compositor doesn't forward. Only tablet pads (ExpressKeys and
+# dials) are affected; keyboards and other input devices stay protected.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TABLET_PAD}=="1", TAG+="uaccess"

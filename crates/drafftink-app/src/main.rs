@@ -3,10 +3,33 @@
 #[cfg(feature = "native")]
 fn main() {
     env_logger::init();
+    log_panics_to_file();
     log::info!("Starting DrafftInk");
 
     let (server, room) = parse_args();
     pollster::block_on(drafftink_app::App::run(server, room));
+}
+
+/// Also write panics to `~/.cache/drafftink/crash.log`: when started from an
+/// app launcher, stderr usually goes nowhere.
+#[cfg(feature = "native")]
+fn log_panics_to_file() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = dirs::cache_dir().map(|d| d.join("drafftink")) {
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            let report = format!("[{:?}] {info}\n{backtrace}\n", std::time::SystemTime::now());
+            let _ = std::fs::create_dir_all(&dir).and_then(|()| {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join("crash.log"))?
+                    .write_all(report.as_bytes())
+            });
+        }
+        default_hook(info);
+    }));
 }
 
 /// Parse `--server <url>` and `--room <id>` from the command line so the

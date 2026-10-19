@@ -13,7 +13,7 @@ mod vello_impl;
 pub mod rex_backend;
 
 pub use renderer::{
-    AngleSnapInfo, GridStyle, RenderContext, Renderer, RendererError, RotationInfo,
+    AngleSnapInfo, GridStyle, RenderContext, Renderer, RendererError, RotationInfo, WritingGuides,
 };
 pub use text_editor::{TextEditResult, TextEditState, TextKey, TextModifiers};
 

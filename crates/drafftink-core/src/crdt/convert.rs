@@ -1,9 +1,9 @@
 //! Conversion between Shape types and Loro values.
 
 use crate::shapes::{
-    Arrow, Ellipse, FillPattern, FontFamily, FontWeight, Freehand, Group, Image, ImageFormat, Line,
-    Math, PathStyle, Rectangle, SerializableColor, Shape, ShapeStyle, ShapeTrait, Sloppiness,
-    StrokeStyle, Text,
+    Arrow, Brush, DEFAULT_NIB_ANGLE, Ellipse, FillPattern, FontFamily, FontWeight, Freehand, Group,
+    Image, ImageFormat, Line, Math, PathStyle, Rectangle, SerializableColor, Shape, ShapeStyle,
+    ShapeTrait, Sloppiness, StrokeStyle, Text,
 };
 use kurbo::Point;
 use loro::{LoroList, LoroMap, LoroMapValue, LoroResult, LoroValue};
@@ -61,6 +61,8 @@ const KEY_HEAD_SIZE: &str = "head_size";
 // Freehand keys
 const KEY_POINTS: &str = "points";
 const KEY_PRESSURES: &str = "pressures";
+const KEY_BRUSH: &str = "brush";
+const KEY_NIB_ANGLE: &str = "nib_angle";
 
 // Text keys
 const KEY_CONTENT: &str = "content";
@@ -188,6 +190,8 @@ pub fn shape_to_loro(shape: &Shape, map: &LoroMap) -> LoroResult<()> {
                     pressures_list.push(*p)?;
                 }
             }
+            map.insert(KEY_BRUSH, freehand.brush.to_index())?;
+            map.insert(KEY_NIB_ANGLE, freehand.nib_angle)?;
             style_to_loro(&freehand.style, map)?;
         }
         Shape::Text(text) => {
@@ -360,6 +364,10 @@ fn freehand_from_loro(map: &LoroMapValue) -> Option<Shape> {
         points_from_loro(map, KEY_POINTS),
         pressures,
         style_from_loro(map)?,
+        get_i64(map, KEY_BRUSH)
+            .map(Brush::from_index)
+            .unwrap_or_default(),
+        get_double(map, KEY_NIB_ANGLE).unwrap_or(DEFAULT_NIB_ANGLE),
     )))
 }
 

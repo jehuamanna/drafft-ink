@@ -37,6 +37,21 @@ pub enum TabletEvent {
         mode: u32,
         angle: Option<f64>,
     },
+    /// Dial turned by `detents` (fractional on high-resolution dials);
+    /// positive is clockwise.
+    Dial {
+        index: usize,
+        mode: u32,
+        detents: f64,
+    },
+    /// Pad dials found by reading the device directly, and whether reading
+    /// a pad was refused for lack of permission.
+    EvdevStatus {
+        dials: usize,
+        permission_denied: bool,
+    },
+    /// Dial turned, read directly from the device.
+    EvdevDial { index: usize, detents: f64 },
     /// Touch strip position (0.0-1.0), or `None` when the finger lifts.
     Strip {
         index: usize,
@@ -73,6 +88,7 @@ pub struct PadInfo {
     pub buttons: u32,
     pub rings: usize,
     pub strips: usize,
+    pub dials: usize,
     /// Modes of the first button group (switched by e.g. the ring button).
     pub modes: u32,
 }
@@ -207,9 +223,9 @@ mod wayland {
         zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
     };
     use wayland_protocols::wp::tablet::zv2::client::{
-        zwp_tablet_manager_v2, zwp_tablet_pad_group_v2, zwp_tablet_pad_ring_v2,
-        zwp_tablet_pad_strip_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2, zwp_tablet_tool_v2,
-        zwp_tablet_v2,
+        zwp_tablet_manager_v2, zwp_tablet_pad_dial_v2, zwp_tablet_pad_group_v2,
+        zwp_tablet_pad_ring_v2, zwp_tablet_pad_strip_v2, zwp_tablet_pad_v2, zwp_tablet_seat_v2,
+        zwp_tablet_tool_v2, zwp_tablet_v2,
     };
     use winit::event_loop::EventLoopProxy;
 
@@ -250,6 +266,7 @@ mod wayland {
         groups: HashMap<ObjectId, (ObjectId, u32)>,
         rings: HashMap<ObjectId, Control>,
         strips: HashMap<ObjectId, Control>,
+        dials: HashMap<ObjectId, Control>,
         tools: HashMap<ObjectId, Tool>,
     }
 
@@ -293,6 +310,7 @@ mod wayland {
             groups: HashMap::new(),
             rings: HashMap::new(),
             strips: HashMap::new(),
+            dials: HashMap::new(),
             tools: HashMap::new(),
         };
 
@@ -302,6 +320,8 @@ mod wayland {
                 let mut queue = queue;
                 if let Err(e) = queue.roundtrip(&mut state) {
                     log::warn!("Tablet: registry roundtrip failed: {e}");
+                    std::mem::forget(queue);
+                    std::mem::forget(state);
                     return;
                 }
                 match (&state.manager, &state.seat) {
@@ -312,6 +332,11 @@ mod wayland {
                     _ => log::info!("Tablet: compositor has no zwp_tablet_manager_v2"),
                 }
                 while queue.blocking_dispatch(&mut state).is_ok() {}
+                // The connection is gone, usually because winit closed it on
+                // exit. Destroying our proxies would touch the freed
+                // wl_display, so leak them; the process is ending anyway.
+                std::mem::forget(queue);
+                std::mem::forget(state);
             });
         if let Err(e) = spawned {
             log::warn!("Tablet: failed to spawn thread: {e}");
@@ -328,7 +353,9 @@ mod wayland {
             qh: &QueueHandle<Self>,
         ) {
             let wl_registry::Event::Global {
-                name, interface, ..
+                name,
+                interface,
+                version,
             } = event
             else {
                 return;
@@ -336,8 +363,10 @@ mod wayland {
             if interface == wl_seat::WlSeat::interface().name && state.seat.is_none() {
                 state.seat = Some(registry.bind(name, 1, qh, ()));
             } else if interface == zwp_tablet_manager_v2::ZwpTabletManagerV2::interface().name {
-                // Version 1: newer versions add pad dials we'd have to handle.
-                state.manager = Some(registry.bind(name, 1, qh, ()));
+                // Version 2 adds pad dials.
+                let version = version.min(2);
+                log::info!("Tablet: tablet protocol version {version}");
+                state.manager = Some(registry.bind(name, version, qh, ()));
             } else if interface == zwp_pointer_gestures_v1::ZwpPointerGesturesV1::interface().name {
                 state.gestures = Some(registry.bind(name, 1, qh, ()));
             }
@@ -588,7 +617,19 @@ mod wayland {
                 Event::Buttons { buttons } => {
                     state.pads.entry(pad.id()).or_default().buttons = buttons;
                 }
-                Event::Done => state.send_devices(),
+                Event::Done => {
+                    if let Some(info) = state.pads.get(&pad.id()) {
+                        log::info!(
+                            "Tablet pad: {} buttons, {} rings, {} strips, {} dials, {} modes",
+                            info.buttons,
+                            info.rings,
+                            info.strips,
+                            info.dials,
+                            info.modes
+                        );
+                    }
+                    state.send_devices();
+                }
                 Event::Button {
                     button,
                     state: button_state,
@@ -646,6 +687,11 @@ mod wayland {
                     state.strips.insert(strip.id(), control(info.strips));
                     info.strips += 1;
                 }
+                Event::Dial { dial } => {
+                    let info = state.pads.entry(pad).or_default();
+                    state.dials.insert(dial.id(), control(info.dials));
+                    info.dials += 1;
+                }
                 Event::Modes { modes } => {
                     let info = state.pads.entry(pad).or_default();
                     info.modes = info.modes.max(modes);
@@ -662,6 +708,7 @@ mod wayland {
         event_created_child!(State, zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2, [
             zwp_tablet_pad_group_v2::EVT_RING_OPCODE => (zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2, ()),
             zwp_tablet_pad_group_v2::EVT_STRIP_OPCODE => (zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2, ()),
+            zwp_tablet_pad_group_v2::EVT_DIAL_OPCODE => (zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, ()),
         ]);
     }
 
@@ -730,6 +777,42 @@ mod wayland {
                         index,
                         mode,
                         position,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2, ()> for State {
+        fn event(
+            state: &mut Self,
+            dial: &zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+            event: zwp_tablet_pad_dial_v2::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            use zwp_tablet_pad_dial_v2::Event;
+            let Some(control) = state.dials.get_mut(&dial.id()) else {
+                return;
+            };
+            match event {
+                // 120 per detent, like high-resolution scroll wheels.
+                Event::Delta { value120 } => {
+                    *control.value.get_or_insert(0.0) += f64::from(value120) / 120.0;
+                }
+                Event::Frame { .. } => {
+                    let Some(detents) = control.value.take() else {
+                        return;
+                    };
+                    let index = control.index;
+                    let group = control.group.clone();
+                    let mode = state.group_mode(&group);
+                    state.send(TabletEvent::Dial {
+                        index,
+                        mode,
+                        detents,
                     });
                 }
                 _ => {}

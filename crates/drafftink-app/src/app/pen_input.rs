@@ -10,6 +10,7 @@ use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 
 use super::App;
+use crate::keybindings::Command;
 use crate::tablet::{
     Devices, OneEuroFilter, PenInfo, PenKind, PenSample, PinchPhase, StylusButton, TabletEvent,
 };
@@ -54,6 +55,8 @@ pub(super) struct PenInput {
     /// control.
     rings: HashMap<usize, (f64, f64)>,
     strips: HashMap<usize, (f64, f64)>,
+    /// Unconsumed dial movement in detents, per dial.
+    dials: HashMap<usize, f64>,
     /// Pinch scale at the previous update.
     pinch_scale: f64,
 }
@@ -77,6 +80,7 @@ impl Default for PenInput {
             eraser_base_radius: None,
             rings: HashMap::new(),
             strips: HashMap::new(),
+            dials: HashMap::new(),
             pinch_scale: 1.0,
         }
     }
@@ -115,11 +119,7 @@ impl App {
             .tablet_settings
             .applies(&self.pen.vendor_ids());
         state.ui_state.tablet_active = active;
-        let settings = if active {
-            state.ui_state.tablet_settings.clone()
-        } else {
-            TabletSettings::plain()
-        };
+        let settings = state.ui_state.tablet_settings.effective(active);
 
         match event {
             TabletEvent::Devices(_) => {}
@@ -171,6 +171,22 @@ impl App {
                 );
                 self.ring_action(action.unwrap_or_default(), steps);
             }
+            TabletEvent::Dial { index, detents, .. } => self.dial(index, detents, &settings),
+            TabletEvent::EvdevStatus {
+                dials,
+                permission_denied,
+            } => {
+                state.ui_state.tablet_evdev_dials = dials;
+                state.ui_state.tablet_evdev_denied = permission_denied;
+                state.window.request_redraw();
+            }
+            TabletEvent::EvdevDial { index, detents } => {
+                // Only needed when the compositor doesn't deliver dials itself.
+                let protocol_dials = self.pen.devices.pads.iter().any(|p| p.dials > 0);
+                if !protocol_dials {
+                    self.dial(index, detents, &settings);
+                }
+            }
             TabletEvent::Pinch(phase) => {
                 if settings.pinch_zoom {
                     self.pinch(phase);
@@ -218,13 +234,6 @@ impl App {
         self.state
             .as_ref()
             .map_or(ToolKind::default(), |s| s.canvas.tool_manager.current_tool)
-    }
-
-    fn queue(&mut self, action: QueuedAction) {
-        if let Some(state) = &mut self.state {
-            state.queued_actions.push_back(action);
-            state.window.request_redraw();
-        }
     }
 
     fn pen_proximity_in(&mut self, info: PenInfo, settings: &TabletSettings) {
@@ -308,7 +317,13 @@ impl App {
             NibAngle::PenRotation if self.pen.pen.has_rotation => sample.rotation.to_radians(),
             _ => settings.nib_angle.to_radians(),
         };
-        pressure *= settings.nib_factor(self.pen.stroke_angle, nib_angle);
+        // The Broad nib brush shapes strokes by direction itself.
+        let broad_nib = self.state.as_ref().is_some_and(|state| {
+            state.canvas.tool_manager.brush == drafftink_core::shapes::Brush::BroadNib
+        });
+        if !broad_nib {
+            pressure *= settings.nib_factor(self.pen.stroke_angle, nib_angle);
+        }
 
         let Some(state) = &mut self.state else {
             return;
@@ -421,6 +436,7 @@ impl App {
                     }
                 }
             }
+            ButtonAction::Command(Command::QuickToolbars) => self.quick_toolbars_key(pressed),
             _ if !pressed => {}
             ButtonAction::SwitchTool(tool) => {
                 if !self.pen.down {
@@ -439,16 +455,9 @@ impl App {
                     self.set_tool(tool);
                 }
             }
-            ButtonAction::Undo => self.queue(QueuedAction::Ui(UiAction::Undo)),
-            ButtonAction::Redo => self.queue(QueuedAction::Ui(UiAction::Redo)),
-            ButtonAction::ZoomIn => self.queue(QueuedAction::Ui(UiAction::ZoomIn)),
-            ButtonAction::ZoomOut => self.queue(QueuedAction::Ui(UiAction::ZoomOut)),
-            ButtonAction::ZoomReset => self.queue(QueuedAction::Ui(UiAction::ZoomReset)),
-            ButtonAction::ZoomToFit => self.queue(QueuedAction::Ui(UiAction::ZoomToFit)),
-            ButtonAction::NextColor => self.queue(QueuedAction::CycleColor(1)),
-            ButtonAction::PreviousColor => self.queue(QueuedAction::CycleColor(-1)),
-            ButtonAction::Thicker => self.queue(QueuedAction::StepWidth(1)),
-            ButtonAction::Thinner => self.queue(QueuedAction::StepWidth(-1)),
+            ButtonAction::Command(command) => {
+                self.run_command(command, false);
+            }
         }
     }
 
@@ -476,9 +485,21 @@ impl App {
         steps as i32
     }
 
-    /// Apply `steps` of ring/strip movement (positive is clockwise / down).
+    /// Apply `steps` of dial/ring/strip movement (positive is clockwise /
+    /// down).
     fn ring_action(&mut self, action: RingAction, steps: i32) {
         if steps == 0 {
+            return;
+        }
+        if let RingAction::Commands {
+            clockwise,
+            anticlockwise,
+        } = action
+        {
+            let command = if steps > 0 { clockwise } else { anticlockwise };
+            for _ in 0..steps.unsigned_abs() {
+                self.run_command(command, false);
+            }
             return;
         }
         let Some(state) = &mut self.state else {
@@ -486,7 +507,7 @@ impl App {
         };
         let cursor = state.input.mouse_position();
         match action {
-            RingAction::None => {}
+            RingAction::None | RingAction::Commands { .. } => {}
             RingAction::Zoom => state.canvas.camera.zoom_at(cursor, 1.1f64.powi(steps)),
             RingAction::ScrollVertical => state
                 .canvas
@@ -517,6 +538,21 @@ impl App {
         }
         state.needs_redraw = true;
         state.window.request_redraw();
+    }
+
+    /// Turn dial `index` by `detents`, running its action once per step.
+    fn dial(&mut self, index: usize, detents: f64, settings: &TabletSettings) {
+        let detents = if settings.dial_reverse {
+            -detents
+        } else {
+            detents
+        };
+        let action = settings.dial_actions.get(index).copied();
+        let per_step = settings.dial_detents_per_step.max(0.1);
+        let total = self.pen.dials.get(&index).copied().unwrap_or(0.0) + detents;
+        let steps = (total / per_step).trunc();
+        self.pen.dials.insert(index, total - steps * per_step);
+        self.ring_action(action.unwrap_or_default(), steps as i32);
     }
 
     fn pinch(&mut self, phase: PinchPhase) {

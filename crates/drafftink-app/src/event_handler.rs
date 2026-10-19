@@ -741,6 +741,8 @@ impl EventHandler {
                     let mut freehand =
                         Freehand::from_points_with_pressure(points.to_vec(), pressures.to_vec());
                     freehand.style = current_style.clone(); // Apply current style
+                    freehand.brush = canvas.tool_manager.brush;
+                    freehand.nib_angle = canvas.tool_manager.nib_angle;
                     canvas.document.push_undo();
                     canvas.document.add_shape(Shape::Freehand(freehand));
                 }

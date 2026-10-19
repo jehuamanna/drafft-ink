@@ -27,11 +27,13 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::event_handler::EventHandler;
+use crate::keybindings::{Command, KeyChord, Keybindings};
+use crate::preferences::Preferences;
 use crate::tablet::UserEvent;
 use crate::tablet_settings::TabletSettings;
 use crate::ui::{
-    QueuedAction, SelectedShapeProps, UiAction, UiState, render_ui, resolve_queued_action,
-    shortcut_action,
+    QueuedAction, SelectedShapeProps, UiAction, UiState, command_action, render_ui,
+    resolve_queued_action,
 };
 
 mod pen_input;
@@ -1588,6 +1590,14 @@ struct AppState {
     queued_actions: std::collections::VecDeque<QueuedAction>,
     /// Tablet settings as last saved, to save again when they change.
     saved_tablet_settings: TabletSettings,
+    /// Keyboard shortcuts as last saved.
+    saved_keybindings: Keybindings,
+    /// Grid and brush preferences as last saved.
+    saved_preferences: Preferences,
+    /// Last "… / back" view command, to undo it if pressed again.
+    view_toggle: Option<ViewToggle>,
+    /// Ignore the next mouse release (its press closed the quick toolbars).
+    suppress_mouse_release: bool,
 
     // Collaboration
     collab: CollaborationManager,
@@ -1780,6 +1790,19 @@ fn close_tab(state: &mut AppState, index: usize) {
     load_tab_into_canvas(state, new_active);
 }
 
+/// A "… / back" view command in effect: the view (camera offset and zoom)
+/// before it ran, and the view it produced once applied.
+struct ViewToggle {
+    command: Command,
+    before: (Vec2, f64),
+    after: Option<(Vec2, f64)>,
+}
+
+/// Whether two views (offset, zoom) are the same, allowing for rounding.
+fn same_view(a: (Vec2, f64), b: (Vec2, f64)) -> bool {
+    (a.0 - b.0).hypot() < 0.5 && (a.1 - b.1).abs() < 1e-6
+}
+
 /// Main application struct.
 pub struct App {
     config: AppConfig,
@@ -1846,6 +1869,492 @@ impl App {
         }
     }
 
+    /// Run a keyboard (or tablet-mapped) command. Returns false if it
+    /// did nothing because the app isn't ready.
+    /// The quick toolbars hotkey (keyboard, pen or tablet button) was pressed
+    /// or released. A press opens the toolbars at the pointer (or closes them
+    /// if open). Releasing after a hold picks the item under the pointer and
+    /// closes them; after a short tap they stay open for a click.
+    pub(crate) fn quick_toolbars_key(&mut self, pressed: bool) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let now = state.egui_ctx.input(|i| i.time);
+        if pressed {
+            state.ui_state.quick_bars = match state.ui_state.quick_bars {
+                Some(_) => None,
+                None => Some(crate::ui::QuickBars::new(now)),
+            };
+        } else if let Some(bars) = state.ui_state.quick_bars {
+            if now - bars.opened_at >= crate::ui::QuickBars::HOLD {
+                if let Some(item) = bars.hovered {
+                    state
+                        .queued_actions
+                        .push_back(QueuedAction::Ui(item.action()));
+                }
+                state.ui_state.quick_bars = None;
+            }
+        }
+        state.needs_redraw = true;
+        state.window.request_redraw();
+    }
+
+    fn run_command(&mut self, command: Command, egui_wants_input: bool) -> bool {
+        let Some(state) = &mut self.state else {
+            return false;
+        };
+        if command == Command::QuickToolbars {
+            self.quick_toolbars_key(true);
+            return true;
+        }
+        if command == Command::Cancel && state.ui_state.quick_bars.take().is_some() {
+            state.window.request_redraw();
+            return true;
+        }
+        // "… / back" view commands: pressed again with the view unchanged
+        // since, return to the view before the first press.
+        if let Some(base) = command.view_toggle_base() {
+            let camera = &mut state.canvas.camera;
+            let current = (camera.offset, camera.zoom);
+            if let Some(toggle) = state.view_toggle.take() {
+                if toggle.command == command && toggle.after.is_some_and(|a| same_view(a, current))
+                {
+                    (camera.offset, camera.zoom) = toggle.before;
+                    state.ui_state.zoom_level = camera.zoom;
+                    state.needs_redraw = true;
+                    state.window.request_redraw();
+                    return true;
+                }
+            }
+            state.view_toggle = Some(ViewToggle {
+                command,
+                before: current,
+                after: None,
+            });
+            return self.run_command(base, egui_wants_input);
+        }
+
+        // Commands that are also UI controls run like clicking them.
+        if let Some(action) = command_action(command) {
+            state.queued_actions.push_back(action);
+            state.window.request_redraw();
+            return true;
+        }
+        match command {
+            Command::Tool(tool) => {
+                state.canvas.set_tool(tool);
+                log::info!("Tool: {tool:?}");
+            }
+            Command::Brush(brush) => {
+                state.canvas.set_tool(ToolKind::Freehand);
+                state.canvas.tool_manager.brush = brush;
+                state.needs_redraw = true;
+                state.window.request_redraw();
+                log::info!("Brush: {brush:?}");
+            }
+            Command::Settings => {
+                state.ui_state.settings_open = true;
+            }
+            Command::SelectAll => {
+                state.canvas.select_all();
+                log::info!("Selected all {} shapes", state.canvas.selection.len());
+            }
+            Command::Save => {
+                file_ops::save_document(&state.canvas.document, &state.canvas.document.name);
+            }
+            Command::Open => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    file_ops::load_document();
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    file_ops::load_document_async();
+                }
+            }
+            Command::ExportPng => {
+                if let Some(render_cx) = self.render_cx.as_ref() {
+                    let device_handle = &render_cx.devices[state.surface.dev_id];
+                    let device = &device_handle.device;
+                    let queue = &device_handle.queue;
+                    let export_scale = state.ui_state.export_scale as f64;
+
+                    let (scene, bounds) = if state.canvas.selection.is_empty() {
+                        state
+                            .shape_renderer
+                            .build_export_scene(&state.canvas.document, export_scale)
+                    } else {
+                        state.shape_renderer.build_export_scene_selection(
+                            &state.canvas.document,
+                            &state.canvas.selection,
+                            export_scale,
+                        )
+                    };
+                    if let Some(bounds) = bounds {
+                        let width = bounds.width().ceil() as u32;
+                        let height = bounds.height().ceil() as u32;
+
+                        log::info!(
+                            "Exporting PNG at {}x scale: {}x{}",
+                            state.ui_state.export_scale,
+                            width,
+                            height
+                        );
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if let Some(result) = render_scene_to_png(
+                                device,
+                                queue,
+                                &mut state.vello_renderer,
+                                &scene,
+                                width,
+                                height,
+                            ) {
+                                let scene_json = state.canvas.document.to_json().ok();
+                                if let Some(png_data) = encode_png(
+                                    &result.rgba_data,
+                                    result.width,
+                                    result.height,
+                                    scene_json.as_deref(),
+                                ) {
+                                    file_ops::export_png(&png_data, &state.canvas.document.name);
+                                }
+                            }
+                        }
+
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let filename = format!("{}.png", state.canvas.document.name);
+                            let scene_json = state.canvas.document.to_json().ok();
+                            spawn_png_export_async(
+                                device, queue, scene, width, height, filename, false, scene_json,
+                            );
+                        }
+                    } else {
+                        log::info!("Nothing to export - document is empty");
+                    }
+                }
+            }
+            Command::CopyPng => {
+                if let Some(render_cx) = self.render_cx.as_ref() {
+                    let device_handle = &render_cx.devices[state.surface.dev_id];
+                    let device = &device_handle.device;
+                    let queue = &device_handle.queue;
+                    let export_scale = state.ui_state.export_scale as f64;
+
+                    let (scene, bounds) = if state.canvas.selection.is_empty() {
+                        state
+                            .shape_renderer
+                            .build_export_scene(&state.canvas.document, export_scale)
+                    } else {
+                        state.shape_renderer.build_export_scene_selection(
+                            &state.canvas.document,
+                            &state.canvas.selection,
+                            export_scale,
+                        )
+                    };
+
+                    if let Some(bounds) = bounds {
+                        let width = bounds.width().ceil() as u32;
+                        let height = bounds.height().ceil() as u32;
+
+                        log::info!(
+                            "Copying PNG at {}x scale: {}x{}",
+                            state.ui_state.export_scale,
+                            width,
+                            height
+                        );
+
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if let Some(result) = render_scene_to_png(
+                                device,
+                                queue,
+                                &mut state.vello_renderer,
+                                &scene,
+                                width,
+                                height,
+                            ) {
+                                file_ops::copy_png_to_clipboard(
+                                    &result.rgba_data,
+                                    result.width,
+                                    result.height,
+                                );
+                            }
+                        }
+
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            spawn_png_export_async(
+                                device,
+                                queue,
+                                scene,
+                                width,
+                                height,
+                                "selection.png".to_string(),
+                                true,
+                                None, // No metadata for clipboard copy
+                            );
+                        }
+                    } else {
+                        log::info!("Nothing to copy - selection is empty");
+                    }
+                }
+            }
+            Command::Undo => {
+                // Undo
+                if state.canvas.document.undo() {
+                    state.canvas.clear_selection();
+                    log::info!("Undo performed");
+                } else {
+                    log::info!("Nothing to undo");
+                }
+            }
+            Command::Redo => {
+                if state.canvas.document.redo() {
+                    state.canvas.clear_selection();
+                    log::info!("Redo performed");
+                } else {
+                    log::info!("Nothing to redo");
+                }
+            }
+            Command::Copy => {
+                if !state.canvas.selection.is_empty() {
+                    let shapes: Vec<Shape> = state
+                        .canvas
+                        .selection
+                        .iter()
+                        .filter_map(|&id| state.canvas.document.get_shape(id).cloned())
+                        .collect();
+                    if let Ok(json) = serde_json::to_string(&shapes) {
+                        state.ui_state.clipboard_shapes = Some(json);
+                        log::info!("Copied {} shapes", shapes.len());
+                    }
+                }
+            }
+            Command::Cut => {
+                if !state.canvas.selection.is_empty() {
+                    let shapes: Vec<Shape> = state
+                        .canvas
+                        .selection
+                        .iter()
+                        .filter_map(|&id| state.canvas.document.get_shape(id).cloned())
+                        .collect();
+                    if let Ok(json) = serde_json::to_string(&shapes) {
+                        state.ui_state.clipboard_shapes = Some(json);
+                        log::info!("Cut {} shapes", shapes.len());
+                        state.canvas.document.push_undo();
+                        for &id in &state.canvas.selection.clone() {
+                            state.canvas.document.remove_shape(id);
+                            if state.collab.is_in_room() {
+                                let _ = state.collab.crdt_mut().remove_shape(&id.to_string());
+                            }
+                        }
+                        state.canvas.clear_selection();
+                    }
+                }
+            }
+            Command::Paste => {
+                // First try to paste shapes from the internal
+                // clipboard, centered on the cursor so pastes
+                // (including across tabs) always land in view.
+                let mut pasted = false;
+                if let Some(json) = &state.ui_state.clipboard_shapes.clone() {
+                    if let Ok(shapes) = serde_json::from_str::<Vec<Shape>>(json) {
+                        let cursor_world = state
+                            .canvas
+                            .camera
+                            .screen_to_world(state.input.mouse_position());
+                        let shapes: Vec<Shape> = shapes
+                            .into_iter()
+                            .map(|mut s| {
+                                s.regenerate_id();
+                                s
+                            })
+                            .collect();
+                        place_shapes_centered_at(
+                            &mut state.canvas,
+                            &mut state.collab,
+                            shapes,
+                            cursor_world,
+                        );
+                        log::info!("Pasted shapes");
+                        pasted = true;
+                    }
+                }
+
+                // Try structured text formats from the
+                // system clipboard (native): Excalidraw
+                // scene JSON first, then Mermaid diagram
+                // source. Both import as native shapes
+                // centered on the mouse cursor.
+                #[cfg(not(target_arch = "wasm32"))]
+                if !pasted {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        if let Ok(text) = cb.get_text() {
+                            let cursor_world = state
+                                .canvas
+                                .camera
+                                .screen_to_world(state.input.mouse_position());
+                            if let Some(shapes) = drafftink_core::canvas::CanvasDocument::shapes_from_excalidraw_clipboard(&text) {
+                                place_shapes_centered_at(
+                                    &mut state.canvas,
+                                    &mut state.collab,
+                                    shapes,
+                                    cursor_world,
+                                );
+                                log::info!("Pasted shapes from Excalidraw clipboard");
+                                pasted = true;
+                            } else if let Some(shapes) = drafftink_core::shapes_from_mermaid(&text) {
+                                place_shapes_centered_at(
+                                    &mut state.canvas,
+                                    &mut state.collab,
+                                    shapes,
+                                    cursor_world,
+                                );
+                                log::info!("Imported Mermaid diagram from clipboard");
+                                pasted = true;
+                            }
+                        }
+                    }
+                }
+
+                // If no shapes, try to paste image from system clipboard
+                #[cfg(not(target_arch = "wasm32"))]
+                if !pasted {
+                    if let Some(image_shape) = file_ops::paste_image_from_clipboard(&state.canvas) {
+                        state.canvas.document.push_undo();
+                        state.canvas.clear_selection();
+                        let new_id = image_shape.id();
+                        state.canvas.document.add_shape(image_shape.clone());
+                        state.canvas.add_to_selection(new_id);
+                        if state.collab.is_in_room() {
+                            let _ = state.collab.crdt_mut().add_shape(&image_shape);
+                        }
+                        log::info!("Pasted image from clipboard");
+                    }
+                }
+
+                // WASM: Try Excalidraw clipboard text first, then image
+                #[cfg(target_arch = "wasm32")]
+                if !pasted {
+                    let cursor_world = state
+                        .canvas
+                        .camera
+                        .screen_to_world(state.input.mouse_position());
+                    file_ops::paste_shapes_from_clipboard_async(cursor_world);
+                    let vw = state.canvas.viewport_size.width;
+                    let vh = state.canvas.viewport_size.height;
+                    let cox = state.canvas.camera.offset.x;
+                    let coy = state.canvas.camera.offset.y;
+                    let cz = state.canvas.camera.zoom;
+                    file_ops::paste_image_from_clipboard_async(vw, vh, cox, coy, cz);
+                }
+            }
+            Command::Duplicate => {
+                if !state.canvas.selection.is_empty() {
+                    state.canvas.document.push_undo();
+                    let mut new_selection = Vec::new();
+                    for &id in &state.canvas.selection.clone() {
+                        if let Some(shape) = state.canvas.document.get_shape(id) {
+                            let mut new_shape = shape.clone();
+                            new_shape.regenerate_id();
+                            new_shape
+                                .transform(kurbo::Affine::translate(kurbo::Vec2::new(20.0, 20.0)));
+                            let new_id = new_shape.id();
+                            state.canvas.document.add_shape(new_shape.clone());
+                            new_selection.push(new_id);
+                            if state.collab.is_in_room() {
+                                let _ = state.collab.crdt_mut().add_shape(&new_shape);
+                            }
+                        }
+                    }
+                    state.canvas.clear_selection();
+                    for id in new_selection {
+                        state.canvas.add_to_selection(id);
+                    }
+                    log::info!("Duplicated shapes");
+                }
+            }
+            Command::Group => {
+                // Group
+                if let Some(group_id) = state.canvas.group_selected() {
+                    log::info!("Grouped shapes into {:?}", group_id);
+                } else {
+                    log::info!("Select at least 2 shapes to group");
+                }
+            }
+            Command::Ungroup => {
+                // Ungroup
+                let ungrouped = state.canvas.ungroup_selected();
+                if !ungrouped.is_empty() {
+                    log::info!("Ungrouped {} shapes", ungrouped.len());
+                } else {
+                    log::info!("No groups to ungroup");
+                }
+            }
+            Command::Delete => {
+                if !state.canvas.selection.is_empty() {
+                    state.canvas.document.push_undo();
+                    state.canvas.delete_selected();
+                }
+            }
+            Command::Cancel => {
+                // Skip if egui is handling this (e.g., closing its own dialogs)
+                if egui_wants_input {
+                    return true;
+                }
+                // First, close any open dialogs/popovers
+                let had_open_dialog = state.ui_state.color_popover != crate::ui::ColorPopover::None
+                    || state.ui_state.menu_open
+                    || state.ui_state.collab_modal_open
+                    || state.ui_state.settings_open
+                    || state.ui_state.save_dialog_open
+                    || state.ui_state.open_dialog_open
+                    || state.ui_state.open_recent_dialog_open;
+
+                if had_open_dialog {
+                    state.ui_state.color_popover = crate::ui::ColorPopover::None;
+                    state.ui_state.menu_open = false;
+                    state.ui_state.collab_modal_open = false;
+                    state.ui_state.settings_open = false;
+                    state.ui_state.key_capture = None;
+                    state.ui_state.save_dialog_open = false;
+                    state.ui_state.open_dialog_open = false;
+                    state.ui_state.open_recent_dialog_open = false;
+                } else {
+                    // No dialog open - switch to Select tool
+                    state.canvas.tool_manager.cancel();
+                    state.canvas.clear_selection();
+                    state.canvas.set_tool(ToolKind::Select);
+                    state.ui_state.current_tool = ToolKind::Select;
+                }
+            }
+            Command::NudgeUp | Command::NudgeDown | Command::NudgeLeft | Command::NudgeRight => {
+                let direction = match command {
+                    Command::NudgeUp => kurbo::Vec2::new(0.0, -1.0),
+                    Command::NudgeDown => kurbo::Vec2::new(0.0, 1.0),
+                    Command::NudgeLeft => kurbo::Vec2::new(-1.0, 0.0),
+                    _ => kurbo::Vec2::new(1.0, 0.0),
+                };
+                if !state.canvas.selection.is_empty() {
+                    use drafftink_core::GRID_SIZE;
+                    let delta = direction * GRID_SIZE;
+                    state.canvas.document.push_undo();
+                    let translation = kurbo::Affine::translate(delta);
+                    for &id in &state.canvas.selection {
+                        if let Some(shape) = state.canvas.document.get_shape_mut(id) {
+                            shape.transform(translation);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     /// Finish initialization after surface is created.
     fn finish_init(&mut self, window: Arc<Window>, surface: RenderSurface<'static>) {
         let render_cx = self
@@ -1897,9 +2406,7 @@ impl App {
             surface.config.width,
             surface.config.height
         );
-        log::info!(
-            "Keyboard shortcuts: V=Select, H=Pan, R=Rectangle, E=Ellipse, L=Line, A=Arrow, P=Pen"
-        );
+        log::info!("Keyboard shortcuts can be changed in Menu > Settings");
 
         self.state = Some(AppState {
             window: window.clone(),
@@ -1924,6 +2431,10 @@ impl App {
             text_edit_state: None,
             queued_actions: std::collections::VecDeque::new(),
             saved_tablet_settings: TabletSettings::default(),
+            saved_keybindings: Keybindings::default(),
+            saved_preferences: Preferences::default(),
+            view_toggle: None,
+            suppress_mouse_release: false,
             pointer_in_window: false,
             brush_cursor_opacity: 1.0,
             collab: CollaborationManager::new(),
@@ -1940,6 +2451,16 @@ impl App {
             let settings = TabletSettings::load();
             state.ui_state.tablet_settings = settings.clone();
             state.saved_tablet_settings = settings;
+            let keybindings = Keybindings::load();
+            state.ui_state.keybindings = keybindings.clone();
+            state.saved_keybindings = keybindings;
+            let preferences = Preferences::load();
+            state.config.grid_style = preferences.grid_style;
+            state.ui_state.grid_style = preferences.grid_style;
+            state.ui_state.writing_guides = preferences.writing_guides;
+            state.canvas.tool_manager.brush = preferences.brush;
+            state.canvas.tool_manager.nib_angle = preferences.nib_angle;
+            state.saved_preferences = preferences;
         }
 
         self.pending_window = None;
@@ -2082,6 +2603,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         #[cfg(target_os = "linux")]
         if let Some(proxy) = self.tablet_proxy.take() {
+            crate::tablet_evdev::spawn(proxy.clone());
             use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
             if let Ok(handle) = event_loop.display_handle() {
                 if let RawDisplayHandle::Wayland(wayland) = handle.as_raw() {
@@ -2598,6 +3120,10 @@ impl ApplicationHandler<UserEvent> for App {
                         &state.ui_state,
                         state.canvas.tool_manager.calligraphy_mode,
                         state.canvas.tool_manager.pressure_simulation,
+                        (
+                            state.canvas.tool_manager.brush,
+                            state.canvas.tool_manager.nib_angle,
+                        ),
                     );
                 }
 
@@ -2934,6 +3460,47 @@ impl ApplicationHandler<UserEvent> for App {
                             UiAction::ToggleGrid => {
                                 state.config.grid_style = state.config.grid_style.next();
                                 state.ui_state.grid_style = state.config.grid_style;
+                            }
+                            UiAction::SetGridStyle(style) => {
+                                state.config.grid_style = style;
+                                state.ui_state.grid_style = style;
+                            }
+                            UiAction::SetBrush(_) | UiAction::SetNibAngle(_) => {
+                                // Selected pen strokes change; with none
+                                // selected it's the brush for new strokes.
+                                let selected: Vec<_> = state.canvas.selection.clone();
+                                let mut changed = false;
+                                for shape_id in selected {
+                                    if let Some(Shape::Freehand(freehand)) =
+                                        state.canvas.document.get_shape_mut(shape_id)
+                                    {
+                                        match action {
+                                            UiAction::SetBrush(brush) => freehand.brush = brush,
+                                            UiAction::SetNibAngle(angle) => {
+                                                freehand.nib_angle = angle
+                                            }
+                                            _ => {}
+                                        }
+                                        changed = true;
+                                    }
+                                }
+                                if changed {
+                                    broadcast_doc_changes(
+                                        &mut state.collab,
+                                        &state.canvas.document,
+                                        state.websocket.as_ref(),
+                                    );
+                                } else {
+                                    match action {
+                                        UiAction::SetBrush(brush) => {
+                                            state.canvas.tool_manager.brush = brush
+                                        }
+                                        UiAction::SetNibAngle(angle) => {
+                                            state.canvas.tool_manager.nib_angle = angle
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                             UiAction::ZoomIn => {
                                 let center = kurbo::Point::new(
@@ -3667,8 +4234,8 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                             UiAction::ShowShortcuts => {
-                                state.ui_state.shortcuts_modal_open =
-                                    !state.ui_state.shortcuts_modal_open;
+                                state.ui_state.settings_open = true;
+                                state.ui_state.settings_tab = crate::ui::SettingsTab::Keyboard;
                             }
                             UiAction::ToggleCalligraphy => {
                                 state.canvas.tool_manager.calligraphy_mode =
@@ -3751,8 +4318,30 @@ impl ApplicationHandler<UserEvent> for App {
                     state.ui_state.tablet_settings.save();
                     state.saved_tablet_settings = state.ui_state.tablet_settings.clone();
                 }
+                if state.ui_state.keybindings != state.saved_keybindings {
+                    state.ui_state.keybindings.save();
+                    state.saved_keybindings = state.ui_state.keybindings.clone();
+                }
+                let preferences = Preferences {
+                    grid_style: state.config.grid_style,
+                    writing_guides: state.ui_state.writing_guides,
+                    brush: state.canvas.tool_manager.brush,
+                    nib_angle: state.canvas.tool_manager.nib_angle,
+                };
+                if preferences != state.saved_preferences {
+                    preferences.save();
+                    state.saved_preferences = preferences;
+                }
                 if !state.queued_actions.is_empty() {
                     state.window.request_redraw();
+                }
+                // Once a "… / back" command's view change has been applied,
+                // remember the resulting view.
+                if let Some(toggle) = &mut state.view_toggle {
+                    if toggle.after.is_none() && state.queued_actions.is_empty() {
+                        let camera = &state.canvas.camera;
+                        toggle.after = Some((camera.offset, camera.zoom));
+                    }
                 }
 
                 if let Some(action) = deferred_action {
@@ -3986,6 +4575,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .with_scale_factor(state.window.scale_factor())
                     .with_background(state.config.background_color)
                     .with_grid(state.config.grid_style)
+                    .with_writing_guides(state.ui_state.writing_guides)
                     .with_selection_rect(selection_rect)
                     .with_editing_shape(state.event_handler.editing_text)
                     .with_snap_point(snap_point)
@@ -4377,6 +4967,19 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
+                // A press outside the quick toolbars just closes them.
+                if btn_state == ElementState::Pressed && state.ui_state.quick_bars.is_some() {
+                    state.ui_state.quick_bars = None;
+                    state.suppress_mouse_release = true;
+                    state.window.request_redraw();
+                    return;
+                }
+                if btn_state == ElementState::Released
+                    && std::mem::take(&mut state.suppress_mouse_release)
+                {
+                    return;
+                }
+
                 let mouse_btn = match button {
                     MouseButton::Left => MouseButton::Left,
                     MouseButton::Right => MouseButton::Right,
@@ -4652,6 +5255,63 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // Capturing a new shortcut in the settings: the next key
+                // press (with modifiers) becomes the binding.
+                if state.ui_state.key_capture.is_some() && event.state == ElementState::Pressed {
+                    let chord = KeyChord::from_event(
+                        &event,
+                        state.input.ctrl(),
+                        state.input.shift(),
+                        state.input.alt(),
+                    );
+                    if let (Some(chord), Some(command)) = (chord, state.ui_state.key_capture) {
+                        state.ui_state.key_capture = None;
+                        let label = chord.label();
+                        state.ui_state.key_capture_note = state
+                            .ui_state
+                            .keybindings
+                            .bind(command, chord)
+                            .map(|previous| {
+                                format!("{label} was moved from \"{}\"", previous.label())
+                            });
+                    }
+                    state.window.request_redraw();
+                    return;
+                }
+
+                // The quick toolbars key acts on press and release (hold to
+                // pick), even with the pointer over the toolbars it opened.
+                if state.event_handler.editing_text.is_none() {
+                    let chord = KeyChord::from_event(
+                        &event,
+                        state.input.ctrl(),
+                        state.input.shift(),
+                        state.input.alt(),
+                    );
+                    let pressed = event.state == ElementState::Pressed;
+                    // Released keys match by key alone: modifiers may have
+                    // been let go first.
+                    let is_quick = chord.is_some_and(|chord| {
+                        if pressed {
+                            state.ui_state.keybindings.command_for(&chord)
+                                == Some(Command::QuickToolbars)
+                        } else {
+                            state
+                                .ui_state
+                                .keybindings
+                                .keys(Command::QuickToolbars)
+                                .iter()
+                                .any(|k| k.key == chord.key)
+                        }
+                    });
+                    if is_quick && !(pressed && state.egui_ctx.wants_keyboard_input()) {
+                        if !event.repeat {
+                            self.quick_toolbars_key(pressed);
+                        }
+                        return;
+                    }
+                }
+
                 // Skip canvas processing if egui wants keyboard
                 if egui_wants_input {
                     state.needs_redraw = true;
@@ -4864,654 +5524,29 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Regular keyboard handling (not text editing)
-                let key_str = match &event.logical_key {
-                    Key::Named(named) => match named {
-                        NamedKey::Escape => "Escape",
-                        NamedKey::Delete => "Delete",
-                        NamedKey::Backspace => "Backspace",
-                        NamedKey::ArrowUp => "ArrowUp",
-                        NamedKey::ArrowDown => "ArrowDown",
-                        NamedKey::ArrowLeft => "ArrowLeft",
-                        NamedKey::ArrowRight => "ArrowRight",
-                        NamedKey::Home => "Home",
-                        _ => return,
-                    },
-                    Key::Character(c) => c.as_str(),
-                    _ => return,
+                // Regular keyboard handling (not text editing): look up the
+                // command bound to the key and run it.
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                let Some(chord) = KeyChord::from_event(
+                    &event,
+                    state.input.ctrl(),
+                    state.input.shift(),
+                    state.input.alt(),
+                ) else {
+                    return;
                 };
 
-                match event.state {
-                    ElementState::Pressed => {
-                        // Zoom, colour and width shortcuts go through the same
-                        // path as clicking the corresponding UI control.
-                        let digit = match event.physical_key {
-                            PhysicalKey::Code(code) => [
-                                KeyCode::Digit0,
-                                KeyCode::Digit1,
-                                KeyCode::Digit2,
-                                KeyCode::Digit3,
-                                KeyCode::Digit4,
-                                KeyCode::Digit5,
-                                KeyCode::Digit6,
-                                KeyCode::Digit7,
-                                KeyCode::Digit8,
-                                KeyCode::Digit9,
-                            ]
-                            .iter()
-                            .position(|&d| d == code)
-                            .map(|n| n as u8),
-                            _ => None,
-                        };
-                        if let Some(action) = shortcut_action(
-                            key_str,
-                            digit,
-                            state.input.ctrl(),
-                            state.input.shift(),
-                            state.input.alt(),
-                            &state.ui_state,
-                        ) {
-                            state.queued_actions.push_back(QueuedAction::Ui(action));
-                            state.window.request_redraw();
-                            return;
-                        }
-
-                        // Check for Ctrl/Cmd modifiers first for file operations
-                        let has_modifier = state.input.ctrl();
-
-                        if has_modifier {
-                            let has_shift = state.input.shift();
-                            match key_str {
-                                "a" | "A" => {
-                                    state.canvas.select_all();
-                                    log::info!(
-                                        "Selected all {} shapes",
-                                        state.canvas.selection.len()
-                                    );
-                                }
-                                "s" | "S" => {
-                                    file_ops::save_document(
-                                        &state.canvas.document,
-                                        &state.canvas.document.name,
-                                    );
-                                }
-                                "o" | "O" => {
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    {
-                                        file_ops::load_document();
-                                    }
-                                    #[cfg(target_arch = "wasm32")]
-                                    {
-                                        file_ops::load_document_async();
-                                    }
-                                }
-                                // Ctrl+Shift+E = Copy PNG to clipboard
-                                "e" | "E" if has_shift => {
-                                    if let Some(render_cx) = self.render_cx.as_ref() {
-                                        let device_handle =
-                                            &render_cx.devices[state.surface.dev_id];
-                                        let device = &device_handle.device;
-                                        let queue = &device_handle.queue;
-                                        let export_scale = state.ui_state.export_scale as f64;
-
-                                        let (scene, bounds) = if state.canvas.selection.is_empty() {
-                                            state.shape_renderer.build_export_scene(
-                                                &state.canvas.document,
-                                                export_scale,
-                                            )
-                                        } else {
-                                            state.shape_renderer.build_export_scene_selection(
-                                                &state.canvas.document,
-                                                &state.canvas.selection,
-                                                export_scale,
-                                            )
-                                        };
-
-                                        if let Some(bounds) = bounds {
-                                            let width = bounds.width().ceil() as u32;
-                                            let height = bounds.height().ceil() as u32;
-
-                                            log::info!(
-                                                "Copying PNG at {}x scale: {}x{}",
-                                                state.ui_state.export_scale,
-                                                width,
-                                                height
-                                            );
-
-                                            #[cfg(not(target_arch = "wasm32"))]
-                                            {
-                                                if let Some(result) = render_scene_to_png(
-                                                    device,
-                                                    queue,
-                                                    &mut state.vello_renderer,
-                                                    &scene,
-                                                    width,
-                                                    height,
-                                                ) {
-                                                    file_ops::copy_png_to_clipboard(
-                                                        &result.rgba_data,
-                                                        result.width,
-                                                        result.height,
-                                                    );
-                                                }
-                                            }
-
-                                            #[cfg(target_arch = "wasm32")]
-                                            {
-                                                spawn_png_export_async(
-                                                    device,
-                                                    queue,
-                                                    scene,
-                                                    width,
-                                                    height,
-                                                    "selection.png".to_string(),
-                                                    true,
-                                                    None,
-                                                );
-                                            }
-                                        } else {
-                                            log::info!("Nothing to copy - selection is empty");
-                                        }
-                                    }
-                                }
-                                // Ctrl+E = Export PNG
-                                "e" | "E" => {
-                                    if let Some(render_cx) = self.render_cx.as_ref() {
-                                        let device_handle =
-                                            &render_cx.devices[state.surface.dev_id];
-                                        let device = &device_handle.device;
-                                        let queue = &device_handle.queue;
-                                        let export_scale = state.ui_state.export_scale as f64;
-
-                                        let (scene, bounds) = if state.canvas.selection.is_empty() {
-                                            state.shape_renderer.build_export_scene(
-                                                &state.canvas.document,
-                                                export_scale,
-                                            )
-                                        } else {
-                                            state.shape_renderer.build_export_scene_selection(
-                                                &state.canvas.document,
-                                                &state.canvas.selection,
-                                                export_scale,
-                                            )
-                                        };
-                                        if let Some(bounds) = bounds {
-                                            let width = bounds.width().ceil() as u32;
-                                            let height = bounds.height().ceil() as u32;
-
-                                            log::info!(
-                                                "Exporting PNG at {}x scale: {}x{}",
-                                                state.ui_state.export_scale,
-                                                width,
-                                                height
-                                            );
-
-                                            #[cfg(not(target_arch = "wasm32"))]
-                                            {
-                                                if let Some(result) = render_scene_to_png(
-                                                    device,
-                                                    queue,
-                                                    &mut state.vello_renderer,
-                                                    &scene,
-                                                    width,
-                                                    height,
-                                                ) {
-                                                    let scene_json =
-                                                        state.canvas.document.to_json().ok();
-                                                    if let Some(png_data) = encode_png(
-                                                        &result.rgba_data,
-                                                        result.width,
-                                                        result.height,
-                                                        scene_json.as_deref(),
-                                                    ) {
-                                                        file_ops::export_png(
-                                                            &png_data,
-                                                            &state.canvas.document.name,
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            #[cfg(target_arch = "wasm32")]
-                                            {
-                                                let filename =
-                                                    format!("{}.png", state.canvas.document.name);
-                                                let scene_json =
-                                                    state.canvas.document.to_json().ok();
-                                                spawn_png_export_async(
-                                                    device, queue, scene, width, height, filename,
-                                                    false, scene_json,
-                                                );
-                                            }
-                                        } else {
-                                            log::info!("Nothing to export - document is empty");
-                                        }
-                                    }
-                                }
-                                // Ctrl+Z = Undo, Ctrl+Shift+Z = Redo
-                                "z" | "Z" => {
-                                    if has_shift {
-                                        // Redo
-                                        if state.canvas.document.redo() {
-                                            state.canvas.clear_selection();
-                                            log::info!("Redo performed");
-                                        } else {
-                                            log::info!("Nothing to redo");
-                                        }
-                                    } else {
-                                        // Undo
-                                        if state.canvas.document.undo() {
-                                            state.canvas.clear_selection();
-                                            log::info!("Undo performed");
-                                        } else {
-                                            log::info!("Nothing to undo");
-                                        }
-                                    }
-                                }
-                                // Ctrl+Y = Redo (alternative)
-                                "y" | "Y" => {
-                                    if state.canvas.document.redo() {
-                                        state.canvas.clear_selection();
-                                        log::info!("Redo performed");
-                                    } else {
-                                        log::info!("Nothing to redo");
-                                    }
-                                }
-                                // Ctrl+G = Group, Ctrl+Shift+G = Ungroup
-                                "g" | "G" => {
-                                    if has_shift {
-                                        // Ungroup
-                                        let ungrouped = state.canvas.ungroup_selected();
-                                        if !ungrouped.is_empty() {
-                                            log::info!("Ungrouped {} shapes", ungrouped.len());
-                                        } else {
-                                            log::info!("No groups to ungroup");
-                                        }
-                                    } else {
-                                        // Group
-                                        if let Some(group_id) = state.canvas.group_selected() {
-                                            log::info!("Grouped shapes into {:?}", group_id);
-                                        } else {
-                                            log::info!("Select at least 2 shapes to group");
-                                        }
-                                    }
-                                }
-                                // Ctrl+Shift+C = Copy PNG
-                                "c" | "C" if has_shift => {
-                                    if let Some(render_cx) = self.render_cx.as_ref() {
-                                        let device_handle =
-                                            &render_cx.devices[state.surface.dev_id];
-                                        let device = &device_handle.device;
-                                        let queue = &device_handle.queue;
-                                        let export_scale = state.ui_state.export_scale as f64;
-
-                                        let (scene, bounds) = if state.canvas.selection.is_empty() {
-                                            state.shape_renderer.build_export_scene(
-                                                &state.canvas.document,
-                                                export_scale,
-                                            )
-                                        } else {
-                                            state.shape_renderer.build_export_scene_selection(
-                                                &state.canvas.document,
-                                                &state.canvas.selection,
-                                                export_scale,
-                                            )
-                                        };
-
-                                        if let Some(bounds) = bounds {
-                                            let width = bounds.width().ceil() as u32;
-                                            let height = bounds.height().ceil() as u32;
-
-                                            log::info!(
-                                                "Copying PNG at {}x scale: {}x{}",
-                                                state.ui_state.export_scale,
-                                                width,
-                                                height
-                                            );
-
-                                            #[cfg(not(target_arch = "wasm32"))]
-                                            {
-                                                if let Some(result) = render_scene_to_png(
-                                                    device,
-                                                    queue,
-                                                    &mut state.vello_renderer,
-                                                    &scene,
-                                                    width,
-                                                    height,
-                                                ) {
-                                                    file_ops::copy_png_to_clipboard(
-                                                        &result.rgba_data,
-                                                        result.width,
-                                                        result.height,
-                                                    );
-                                                }
-                                            }
-
-                                            #[cfg(target_arch = "wasm32")]
-                                            {
-                                                spawn_png_export_async(
-                                                    device,
-                                                    queue,
-                                                    scene,
-                                                    width,
-                                                    height,
-                                                    "selection.png".to_string(),
-                                                    true,
-                                                    None, // No metadata for clipboard copy
-                                                );
-                                            }
-                                        } else {
-                                            log::info!("Nothing to copy - selection is empty");
-                                        }
-                                    }
-                                }
-                                // Ctrl+C = Copy shapes (without shift)
-                                "c" | "C" => {
-                                    if !state.canvas.selection.is_empty() {
-                                        let shapes: Vec<Shape> = state
-                                            .canvas
-                                            .selection
-                                            .iter()
-                                            .filter_map(|&id| {
-                                                state.canvas.document.get_shape(id).cloned()
-                                            })
-                                            .collect();
-                                        if let Ok(json) = serde_json::to_string(&shapes) {
-                                            state.ui_state.clipboard_shapes = Some(json);
-                                            log::info!("Copied {} shapes", shapes.len());
-                                        }
-                                    }
-                                }
-                                // Ctrl+X = Cut shapes
-                                "x" | "X" => {
-                                    if !state.canvas.selection.is_empty() {
-                                        let shapes: Vec<Shape> = state
-                                            .canvas
-                                            .selection
-                                            .iter()
-                                            .filter_map(|&id| {
-                                                state.canvas.document.get_shape(id).cloned()
-                                            })
-                                            .collect();
-                                        if let Ok(json) = serde_json::to_string(&shapes) {
-                                            state.ui_state.clipboard_shapes = Some(json);
-                                            log::info!("Cut {} shapes", shapes.len());
-                                            state.canvas.document.push_undo();
-                                            for &id in &state.canvas.selection.clone() {
-                                                state.canvas.document.remove_shape(id);
-                                                if state.collab.is_in_room() {
-                                                    let _ = state
-                                                        .collab
-                                                        .crdt_mut()
-                                                        .remove_shape(&id.to_string());
-                                                }
-                                            }
-                                            state.canvas.clear_selection();
-                                        }
-                                    }
-                                }
-                                // Ctrl+V = Paste shapes or image
-                                "v" | "V" => {
-                                    // First try to paste shapes from the internal
-                                    // clipboard, centered on the cursor so pastes
-                                    // (including across tabs) always land in view.
-                                    let mut pasted = false;
-                                    if let Some(json) = &state.ui_state.clipboard_shapes.clone() {
-                                        if let Ok(shapes) = serde_json::from_str::<Vec<Shape>>(json)
-                                        {
-                                            let cursor_world = state
-                                                .canvas
-                                                .camera
-                                                .screen_to_world(state.input.mouse_position());
-                                            let shapes: Vec<Shape> = shapes
-                                                .into_iter()
-                                                .map(|mut s| {
-                                                    s.regenerate_id();
-                                                    s
-                                                })
-                                                .collect();
-                                            place_shapes_centered_at(
-                                                &mut state.canvas,
-                                                &mut state.collab,
-                                                shapes,
-                                                cursor_world,
-                                            );
-                                            log::info!("Pasted shapes");
-                                            pasted = true;
-                                        }
-                                    }
-
-                                    // Try structured text formats from the
-                                    // system clipboard (native): Excalidraw
-                                    // scene JSON first, then Mermaid diagram
-                                    // source. Both import as native shapes
-                                    // centered on the mouse cursor.
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    if !pasted {
-                                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                                            if let Ok(text) = cb.get_text() {
-                                                let cursor_world = state
-                                                    .canvas
-                                                    .camera
-                                                    .screen_to_world(state.input.mouse_position());
-                                                if let Some(shapes) = drafftink_core::canvas::CanvasDocument::shapes_from_excalidraw_clipboard(&text) {
-                                                    place_shapes_centered_at(
-                                                        &mut state.canvas,
-                                                        &mut state.collab,
-                                                        shapes,
-                                                        cursor_world,
-                                                    );
-                                                    log::info!("Pasted shapes from Excalidraw clipboard");
-                                                    pasted = true;
-                                                } else if let Some(shapes) = drafftink_core::shapes_from_mermaid(&text) {
-                                                    place_shapes_centered_at(
-                                                        &mut state.canvas,
-                                                        &mut state.collab,
-                                                        shapes,
-                                                        cursor_world,
-                                                    );
-                                                    log::info!("Imported Mermaid diagram from clipboard");
-                                                    pasted = true;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // If no shapes, try to paste image from system clipboard
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    if !pasted {
-                                        if let Some(image_shape) =
-                                            file_ops::paste_image_from_clipboard(&state.canvas)
-                                        {
-                                            state.canvas.document.push_undo();
-                                            state.canvas.clear_selection();
-                                            let new_id = image_shape.id();
-                                            state.canvas.document.add_shape(image_shape.clone());
-                                            state.canvas.add_to_selection(new_id);
-                                            if state.collab.is_in_room() {
-                                                let _ =
-                                                    state.collab.crdt_mut().add_shape(&image_shape);
-                                            }
-                                            log::info!("Pasted image from clipboard");
-                                        }
-                                    }
-
-                                    // WASM: Try Excalidraw clipboard text first, then image
-                                    #[cfg(target_arch = "wasm32")]
-                                    if !pasted {
-                                        let cursor_world = state
-                                            .canvas
-                                            .camera
-                                            .screen_to_world(state.input.mouse_position());
-                                        file_ops::paste_shapes_from_clipboard_async(cursor_world);
-                                        let vw = state.canvas.viewport_size.width;
-                                        let vh = state.canvas.viewport_size.height;
-                                        let cox = state.canvas.camera.offset.x;
-                                        let coy = state.canvas.camera.offset.y;
-                                        let cz = state.canvas.camera.zoom;
-                                        file_ops::paste_image_from_clipboard_async(
-                                            vw, vh, cox, coy, cz,
-                                        );
-                                    }
-                                }
-                                // Ctrl+D = Duplicate shapes
-                                "d" | "D" => {
-                                    if !state.canvas.selection.is_empty() {
-                                        state.canvas.document.push_undo();
-                                        let mut new_selection = Vec::new();
-                                        for &id in &state.canvas.selection.clone() {
-                                            if let Some(shape) = state.canvas.document.get_shape(id)
-                                            {
-                                                let mut new_shape = shape.clone();
-                                                new_shape.regenerate_id();
-                                                new_shape.transform(kurbo::Affine::translate(
-                                                    kurbo::Vec2::new(20.0, 20.0),
-                                                ));
-                                                let new_id = new_shape.id();
-                                                state.canvas.document.add_shape(new_shape.clone());
-                                                new_selection.push(new_id);
-                                                if state.collab.is_in_room() {
-                                                    let _ = state
-                                                        .collab
-                                                        .crdt_mut()
-                                                        .add_shape(&new_shape);
-                                                }
-                                            }
-                                        }
-                                        state.canvas.clear_selection();
-                                        for id in new_selection {
-                                            state.canvas.add_to_selection(id);
-                                        }
-                                        log::info!("Duplicated shapes");
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            match key_str {
-                                // Selection: V or 1
-                                "v" | "V" | "1" => {
-                                    state.canvas.set_tool(ToolKind::Select);
-                                    log::info!("Tool: Select");
-                                }
-                                // Pan: H
-                                "h" | "H" => {
-                                    state.canvas.set_tool(ToolKind::Pan);
-                                    log::info!("Tool: Pan");
-                                }
-                                // Rectangle: R or 2
-                                "r" | "R" | "2" => {
-                                    state.canvas.set_tool(ToolKind::Rectangle);
-                                    log::info!("Tool: Rectangle");
-                                }
-                                // Ellipse: O or 4
-                                "o" | "O" | "4" => {
-                                    state.canvas.set_tool(ToolKind::Ellipse);
-                                    log::info!("Tool: Ellipse");
-                                }
-                                // Arrow: A or 5
-                                "a" | "A" | "5" => {
-                                    state.canvas.set_tool(ToolKind::Arrow);
-                                    log::info!("Tool: Arrow");
-                                }
-                                // Line: L or 6
-                                "l" | "L" | "6" => {
-                                    state.canvas.set_tool(ToolKind::Line);
-                                    log::info!("Tool: Line");
-                                }
-                                // Draw/Pen: P or 7
-                                "p" | "P" | "7" => {
-                                    state.canvas.set_tool(ToolKind::Freehand);
-                                    log::info!("Tool: Pen");
-                                }
-                                // Text: T or 8
-                                "t" | "T" | "8" => {
-                                    state.canvas.set_tool(ToolKind::Text);
-                                    log::info!("Tool: Text");
-                                }
-                                // Math: M or 9
-                                "m" | "M" | "9" => {
-                                    state.canvas.set_tool(ToolKind::Math);
-                                    log::info!("Tool: Math");
-                                }
-                                // Eraser: E
-                                "e" | "E" => {
-                                    state.canvas.set_tool(ToolKind::Eraser);
-                                    log::info!("Tool: Eraser");
-                                }
-                                // Laser Pointer: Z
-                                "z" | "Z" => {
-                                    state.canvas.set_tool(ToolKind::LaserPointer);
-                                    log::info!("Tool: Laser Pointer");
-                                }
-                                "Delete" | "Backspace" => {
-                                    if !state.canvas.selection.is_empty() {
-                                        state.canvas.document.push_undo();
-                                        state.canvas.delete_selected();
-                                    }
-                                }
-                                "Escape" => {
-                                    // Skip if egui is handling this (e.g., closing its own dialogs)
-                                    if egui_wants_input {
-                                        return;
-                                    }
-                                    // First, close any open dialogs/popovers
-                                    let had_open_dialog = state.ui_state.color_popover
-                                        != crate::ui::ColorPopover::None
-                                        || state.ui_state.menu_open
-                                        || state.ui_state.collab_modal_open
-                                        || state.ui_state.shortcuts_modal_open
-                                        || state.ui_state.save_dialog_open
-                                        || state.ui_state.open_dialog_open
-                                        || state.ui_state.open_recent_dialog_open;
-
-                                    if had_open_dialog {
-                                        state.ui_state.color_popover =
-                                            crate::ui::ColorPopover::None;
-                                        state.ui_state.menu_open = false;
-                                        state.ui_state.collab_modal_open = false;
-                                        state.ui_state.shortcuts_modal_open = false;
-                                        state.ui_state.save_dialog_open = false;
-                                        state.ui_state.open_dialog_open = false;
-                                        state.ui_state.open_recent_dialog_open = false;
-                                    } else {
-                                        // No dialog open - switch to Select tool
-                                        state.canvas.tool_manager.cancel();
-                                        state.canvas.clear_selection();
-                                        state.canvas.set_tool(ToolKind::Select);
-                                        state.ui_state.current_tool = ToolKind::Select;
-                                    }
-                                }
-                                // Arrow keys: nudge selected shapes by grid size
-                                "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => {
-                                    if !state.canvas.selection.is_empty() {
-                                        use drafftink_core::GRID_SIZE;
-                                        let delta = match key_str {
-                                            "ArrowUp" => kurbo::Vec2::new(0.0, -GRID_SIZE),
-                                            "ArrowDown" => kurbo::Vec2::new(0.0, GRID_SIZE),
-                                            "ArrowLeft" => kurbo::Vec2::new(-GRID_SIZE, 0.0),
-                                            "ArrowRight" => kurbo::Vec2::new(GRID_SIZE, 0.0),
-                                            _ => return,
-                                        };
-                                        state.canvas.document.push_undo();
-                                        let translation = kurbo::Affine::translate(delta);
-                                        for &id in &state.canvas.selection {
-                                            if let Some(shape) =
-                                                state.canvas.document.get_shape_mut(id)
-                                            {
-                                                shape.transform(translation);
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    ElementState::Released => {
-                        // Input state is handled by WinitInputHelper
-                    }
+                let Some(command) = state.ui_state.keybindings.command_for(&chord) else {
+                    return;
+                };
+                if !self.run_command(command, egui_wants_input) {
+                    return;
                 }
+                let Some(state) = &mut self.state else {
+                    return;
+                };
                 state.needs_redraw = true;
                 state.window.request_redraw();
             }

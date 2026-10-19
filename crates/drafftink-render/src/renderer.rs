@@ -23,7 +23,9 @@ pub enum RendererError {
 pub type RenderResult<T> = Result<T, RendererError>;
 
 /// Grid display style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum GridStyle {
     /// No grid (plain white background).
     None,
@@ -36,18 +38,33 @@ pub enum GridStyle {
     CrossPlus,
     /// Only corner dots (.).
     Dots,
+    /// Handwriting practice: top line, dashed midline and baseline.
+    Handwriting,
+    /// Calligraphy practice: ascender, x-height, baseline and descender lines.
+    Calligraphy,
 }
 
 impl GridStyle {
+    /// All styles, in cycling order.
+    pub const ALL: [GridStyle; 7] = [
+        GridStyle::None,
+        GridStyle::Lines,
+        GridStyle::HorizontalLines,
+        GridStyle::CrossPlus,
+        GridStyle::Dots,
+        GridStyle::Handwriting,
+        GridStyle::Calligraphy,
+    ];
+
     /// Cycle to the next grid style.
     pub fn next(self) -> Self {
-        match self {
-            GridStyle::None => GridStyle::Lines,
-            GridStyle::Lines => GridStyle::HorizontalLines,
-            GridStyle::HorizontalLines => GridStyle::CrossPlus,
-            GridStyle::CrossPlus => GridStyle::Dots,
-            GridStyle::Dots => GridStyle::None,
-        }
+        let i = Self::ALL.iter().position(|&s| s == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// Whether this style is a writing guide (uses [`WritingGuides`]).
+    pub fn is_writing_guide(self) -> bool {
+        matches!(self, GridStyle::Handwriting | GridStyle::Calligraphy)
     }
 
     /// Get display name for this grid style.
@@ -58,7 +75,53 @@ impl GridStyle {
             GridStyle::HorizontalLines => "Lines",
             GridStyle::CrossPlus => "Crosses",
             GridStyle::Dots => "Dots",
+            GridStyle::Handwriting => "Handwriting (3 lines)",
+            GridStyle::Calligraphy => "Calligraphy (4 lines)",
         }
+    }
+}
+
+/// Proportions of the handwriting and calligraphy guide lines. Sizes are in
+/// canvas units, so the guides zoom with your writing.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WritingGuides {
+    /// Height of lowercase letters such as "x" (baseline to waist line).
+    pub x_height: f64,
+    /// Ascender height above the waist line, as a multiple of the x-height.
+    pub ascender: f64,
+    /// Descender depth below the baseline, as a multiple of the x-height.
+    pub descender: f64,
+    /// Space between rows, as a multiple of the x-height.
+    pub row_gap: f64,
+    /// Slant guide angle in degrees from vertical (0 = no slant lines).
+    pub slant: f64,
+}
+
+impl Default for WritingGuides {
+    fn default() -> Self {
+        Self {
+            x_height: 40.0,
+            ascender: 1.0,
+            descender: 1.0,
+            row_gap: 0.5,
+            slant: 0.0,
+        }
+    }
+}
+
+impl WritingGuides {
+    /// Classic proportions to start from: (name, ascender, descender, slant).
+    pub const PRESETS: [(&'static str, f64, f64, f64); 4] = [
+        ("Even (1:1:1)", 1.0, 1.0, 0.0),
+        ("Italic (5:5:5)", 1.0, 1.0, 7.0),
+        ("Foundational (3:4:3)", 0.75, 0.75, 0.0),
+        ("Copperplate (3:2:3, 55°)", 1.5, 1.5, 35.0),
+    ];
+
+    /// Distance from one baseline to the next.
+    pub fn row_height(&self) -> f64 {
+        self.x_height.max(1.0) * (self.ascender + 1.0 + self.descender + self.row_gap).max(0.5)
     }
 }
 
@@ -98,6 +161,8 @@ pub struct RenderContext<'a> {
     pub background_color: Color,
     /// Grid display style.
     pub grid_style: GridStyle,
+    /// Line proportions for the writing guide grid styles.
+    pub writing_guides: WritingGuides,
     /// Selection highlight color.
     pub selection_color: Color,
     /// Selection rectangle (marquee) in world coordinates.
@@ -130,6 +195,7 @@ impl<'a> RenderContext<'a> {
             scale_factor: 1.0,
             background_color: Color::from_rgba8(250, 250, 250, 255),
             grid_style: GridStyle::Lines,
+            writing_guides: WritingGuides::default(),
             selection_color: Color::from_rgba8(59, 130, 246, 255), // Blue
             selection_rect: None,
             editing_shape_id: None,
@@ -158,6 +224,12 @@ impl<'a> RenderContext<'a> {
     /// Set the grid style.
     pub fn with_grid(mut self, style: GridStyle) -> Self {
         self.grid_style = style;
+        self
+    }
+
+    /// Set the writing guide proportions.
+    pub fn with_writing_guides(mut self, guides: WritingGuides) -> Self {
+        self.writing_guides = guides;
         self
     }
 
