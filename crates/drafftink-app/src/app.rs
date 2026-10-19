@@ -3470,6 +3470,7 @@ impl ApplicationHandler<UserEvent> for App {
                             UiAction::SwitchTab(_)
                             | UiAction::CloseTab(_)
                             | UiAction::ShowPractice(_)
+                            | UiAction::NewDocument
                             | UiAction::LoadLibrary => {
                                 // Tab operations need exclusive access to the
                                 // whole AppState, which the egui closure cannot
@@ -4354,6 +4355,20 @@ impl ApplicationHandler<UserEvent> for App {
                         UiAction::SwitchTab(i) => switch_to_tab(state, i),
                         UiAction::CloseTab(i) => close_tab(state, i),
                         UiAction::LoadLibrary => file_ops::load_excalidrawlib_async(),
+                        UiAction::NewDocument => {
+                            // "Untitled", or "Untitled 2", 3... if taken.
+                            let name = (1..)
+                                .map(|n| match n {
+                                    1 => "Untitled".to_string(),
+                                    n => format!("Untitled {n}"),
+                                })
+                                .find(|name| state.tabs.iter().all(|t| &t.name != name))
+                                .unwrap_or_default();
+                            let mut doc = drafftink_core::canvas::CanvasDocument::new();
+                            doc.name = name.clone();
+                            add_tab(state, name, doc);
+                            log::info!("New document");
+                        }
                         UiAction::ShowPractice(sheet) => {
                             // Its own tab (reused if still open), on the
                             // guide lines the letters were laid out on.

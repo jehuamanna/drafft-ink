@@ -76,6 +76,8 @@ pub enum Command {
     ToggleSmartSnap,
     ToggleAngleSnap,
     // File
+    /// New empty document in its own tab.
+    NewDocument,
     Save,
     Open,
     ExportPng,
@@ -202,6 +204,7 @@ pub const COMMAND_GROUPS: &[(&str, &[Command])] = &[
     (
         "File",
         &[
+            Command::NewDocument,
             Command::Save,
             Command::Open,
             Command::ExportPng,
@@ -292,6 +295,7 @@ impl Command {
             Self::ToggleGridSnap => "Toggle grid snap".into(),
             Self::ToggleSmartSnap => "Toggle smart guides".into(),
             Self::ToggleAngleSnap => "Toggle angle snap".into(),
+            Self::NewDocument => "New document".into(),
             Self::Save => "Save".into(),
             Self::Open => "Open".into(),
             Self::ExportPng => "Export PNG".into(),
@@ -502,6 +506,7 @@ impl Default for Keybindings {
             bind(ZoomReset, vec![k("0").ctrl()]),
             bind(ZoomToFit, vec![k("1").shift()]),
             bind(CenterCanvas, vec![k("Home")]),
+            bind(NewDocument, vec![k("n").ctrl()]),
             bind(Save, vec![k("s").ctrl()]),
             bind(Open, vec![k("o").ctrl()]),
             bind(ExportPng, vec![k("e").ctrl()]),

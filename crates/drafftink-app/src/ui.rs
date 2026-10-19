@@ -546,6 +546,8 @@ pub enum UiAction {
     ClearDocument,
     /// Show intro/welcome screen.
     ShowIntro,
+    /// Open a new empty document in its own tab.
+    NewDocument,
     /// Open a handwriting or calligraphy practice sheet in its own tab.
     ShowPractice(drafftink_core::practice::PracticeSheet),
     /// Set sloppiness level for selected shapes.
@@ -813,6 +815,19 @@ fn render_tab_bar(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                     }
 
                     ui.add_space(6.0);
+                    let new = egui::Button::new(
+                        egui::RichText::new("+ New")
+                            .size(12.0)
+                            .color(Color32::from_gray(90)),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .corner_radius(egui::CornerRadius::same(4));
+                    let new_tooltip = ui_state
+                        .keybindings
+                        .with_hint("New document in its own tab", Command::NewDocument);
+                    if ui.add(new).on_hover_text(new_tooltip).clicked() {
+                        action = Some(UiAction::NewDocument);
+                    }
                     let load = egui::Button::new(
                         egui::RichText::new("+ Library")
                             .size(12.0)
@@ -1309,6 +1324,7 @@ pub fn command_action(command: Command) -> Option<QueuedAction> {
         Command::ZoomReset => ui(UiAction::ZoomReset),
         Command::ZoomToFit => ui(UiAction::ZoomToFit),
         Command::CenterCanvas => ui(UiAction::CenterCanvas),
+        Command::NewDocument => ui(UiAction::NewDocument),
         Command::ToggleGrid => ui(UiAction::ToggleGrid),
         Command::Grid(style) => ui(UiAction::SetGridStyle(style)),
         Command::ToggleGridSnap => ui(UiAction::ToggleGridSnap),
@@ -2424,6 +2440,14 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
 
+                        if menu_item(
+                            ui,
+                            "New Document",
+                            &ui_state.keybindings.hint(Command::NewDocument),
+                        ) {
+                            action = Some(UiAction::NewDocument);
+                            ui_state.menu_open = false;
+                        }
                         if menu_item(ui, "Save Local", &ui_state.keybindings.hint(Command::Save)) {
                             action = Some(UiAction::SaveLocal);
                             ui_state.menu_open = false;
