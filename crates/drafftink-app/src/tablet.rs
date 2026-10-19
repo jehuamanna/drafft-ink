@@ -10,6 +10,9 @@
 #[derive(Debug, Clone)]
 pub enum UserEvent {
     Tablet(TabletEvent),
+    /// Background work finished (such as a file loading): redraw to pick up
+    /// its result.
+    Wake,
 }
 
 /// A tablet event. Positions are surface-local logical coordinates.

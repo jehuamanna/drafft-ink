@@ -46,6 +46,22 @@ pub mod file_ops {
     // Channel for receiving async file operation results
     static PENDING_DOCUMENT: Mutex<Option<CanvasDocument>> = Mutex::new(None);
     static PENDING_LIBRARY: Mutex<Option<(String, CanvasDocument)>> = Mutex::new(None);
+    /// Wakes the event loop when a background file operation finishes, so its
+    /// result shows without waiting for the next input event.
+    static WAKER: Mutex<Option<winit::event_loop::EventLoopProxy<crate::tablet::UserEvent>>> =
+        Mutex::new(None);
+
+    pub fn set_waker(proxy: winit::event_loop::EventLoopProxy<crate::tablet::UserEvent>) {
+        if let Ok(mut waker) = WAKER.lock() {
+            *waker = Some(proxy);
+        }
+    }
+
+    fn wake() {
+        if let Some(proxy) = WAKER.lock().ok().and_then(|w| w.clone()) {
+            let _ = proxy.send_event(crate::tablet::UserEvent::Wake);
+        }
+    }
 
     /// Save document to a JSON file using native file dialog (async, non-blocking).
     pub fn save_document(document: &CanvasDocument, name: &str) {
@@ -96,11 +112,16 @@ pub mod file_ops {
                         };
 
                         match result {
-                            Ok(doc) => {
+                            Ok(mut doc) => {
                                 log::info!("Loaded document from: {:?}", path);
+                                // Name it after the file, as it's shown in its tab.
+                                if let Some(stem) = path.file_stem() {
+                                    doc.name = stem.to_string_lossy().to_string();
+                                }
                                 if let Ok(mut pending) = PENDING_DOCUMENT.lock() {
                                     *pending = Some(doc);
                                 }
+                                wake();
                             }
                             Err(e) => log::error!("Failed to parse document: {}", e),
                         }
@@ -135,6 +156,7 @@ pub mod file_ops {
                                 if let Ok(mut pending) = PENDING_LIBRARY.lock() {
                                     *pending = Some(result);
                                 }
+                                wake();
                             }
                             None => log::error!("Not a valid Excalidraw library: {:?}", path),
                         }
@@ -1768,6 +1790,31 @@ fn add_tab(state: &mut AppState, name: String, document: drafftink_core::canvas:
     load_tab_into_canvas(state, index);
 }
 
+/// Show an opened document: in the current tab if that's empty, otherwise
+/// in a new tab, with the view fitted to its content.
+fn open_document(state: &mut AppState, document: drafftink_core::canvas::CanvasDocument) {
+    let name = if document.name.trim().is_empty() {
+        "Untitled".to_string()
+    } else {
+        document.name.clone()
+    };
+    if state.canvas.document.is_empty() {
+        state.tabs[state.active_tab].name = name;
+        state.canvas.document = document;
+        state.canvas.clear_selection();
+    } else {
+        add_tab(state, name, document);
+    }
+    if let Some(bounds) = state.canvas.document.bounds() {
+        state
+            .canvas
+            .camera
+            .fit_to_bounds(bounds, state.canvas.viewport_size, 50.0);
+    }
+    state.needs_redraw = true;
+    state.window.request_redraw();
+}
+
 /// Close the tab at `index`. The last remaining tab is never closed.
 fn close_tab(state: &mut AppState, index: usize) {
     if state.tabs.len() <= 1 || index >= state.tabs.len() {
@@ -1853,6 +1900,8 @@ impl App {
             .expect("Failed to create event loop");
         let mut app = App::new();
         app.tablet_proxy = Some(event_loop.create_proxy());
+        #[cfg(feature = "native")]
+        file_ops::set_waker(event_loop.create_proxy());
         app.startup_server = server;
         app.startup_room = room;
 
@@ -2868,9 +2917,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Check for pending document from async file load
                 if let Some(doc) = file_ops::take_pending_document() {
-                    state.canvas.document = doc;
-                    state.canvas.clear_selection();
-                    state.needs_redraw = true;
+                    open_document(state, doc);
                 }
 
                 // Check for a pending Excalidraw library loaded into a new tab.
@@ -5688,6 +5735,12 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Tablet(event) => self.handle_tablet_event(event_loop, event),
+            UserEvent::Wake => {
+                if let Some(state) = &mut self.state {
+                    state.needs_redraw = true;
+                    state.window.request_redraw();
+                }
+            }
         }
     }
 
