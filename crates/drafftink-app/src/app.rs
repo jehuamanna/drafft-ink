@@ -27,105 +27,66 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::event_handler::EventHandler;
-use crate::keybindings::{Command, KeyChord, Keybindings};
-use crate::preferences::Preferences;
+use crate::keybindings::KeyChord;
 use crate::tablet::UserEvent;
-use crate::tablet_settings::TabletSettings;
-use crate::ui::{
-    QueuedAction, SelectedShapeProps, UiAction, UiState, command_action, render_ui,
-    resolve_queued_action,
-};
+use crate::ui::{SelectedShapeProps, UiAction, UiState, render_ui, resolve_queued_action};
 
+// This fork's features live in these modules, to keep upstream merges simple.
+mod actions;
+mod commands;
+mod documents;
+mod extra;
+#[cfg(feature = "native")]
+mod file_io;
 mod pen_input;
+
+#[cfg(target_arch = "wasm32")]
+use documents::open_document;
+use documents::{request_close_tab, tab_is_dirty};
 
 #[cfg(feature = "native")]
 pub mod file_ops {
     use drafftink_core::canvas::CanvasDocument;
     use std::sync::Mutex;
 
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
-    // Channels for receiving async file operation results
+    pub use super::file_io::*;
+
+    // Channel for receiving async file operation results
     static PENDING_DOCUMENT: Mutex<Option<(CanvasDocument, Option<PathBuf>)>> = Mutex::new(None);
     static PENDING_LIBRARY: Mutex<Option<(String, CanvasDocument)>> = Mutex::new(None);
-    /// Saves finished from a file dialog: (tab id, file, document revision).
-    static PENDING_SAVES: Mutex<Vec<(u64, PathBuf, u64)>> = Mutex::new(Vec::new());
 
-    /// Wakes the event loop when a background file operation finishes, so its
-    /// result shows without waiting for the next input event.
-    static WAKER: Mutex<Option<winit::event_loop::EventLoopProxy<crate::tablet::UserEvent>>> =
-        Mutex::new(None);
-
-    pub fn set_waker(proxy: winit::event_loop::EventLoopProxy<crate::tablet::UserEvent>) {
-        if let Ok(mut waker) = WAKER.lock() {
-            *waker = Some(proxy);
-        }
-    }
-
-    fn wake() {
-        if let Some(proxy) = WAKER.lock().ok().and_then(|w| w.clone()) {
-            let _ = proxy.send_event(crate::tablet::UserEvent::Wake);
-        }
-    }
-
-    /// Read a saved document, named after its file.
-    pub fn read_document(path: &Path) -> Result<CanvasDocument, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let mut doc = CanvasDocument::from_json(&content).map_err(|e| e.to_string())?;
-        if let Some(stem) = path.file_stem() {
-            doc.name = stem.to_string_lossy().to_string();
-        }
-        Ok(doc)
-    }
-
-    /// Write a document to `path`. Writes a temporary file first and renames
-    /// it over the old one, so a failed save never leaves a half-written file.
-    pub fn write_document(document: &CanvasDocument, path: &Path) -> Result<(), String> {
-        let json = document.to_json().map_err(|e| e.to_string())?;
-        let mut temp = path.as_os_str().to_owned();
-        temp.push(".saving");
-        let temp = PathBuf::from(temp);
-        std::fs::write(&temp, json).map_err(|e| e.to_string())?;
-        std::fs::rename(&temp, path).map_err(|e| e.to_string())?;
-        log::info!("Saved document to: {path:?}");
-        Ok(())
-    }
-
-    /// Ask where to save a tab's document, then save it there (async,
-    /// non-blocking). Finished saves come back from `take_pending_saves()`.
-    pub fn save_document_as(document: CanvasDocument, name: String, tab_id: u64, revision: u64) {
+    /// Save document to a JSON file using native file dialog (async, non-blocking).
+    #[allow(dead_code)] // tabs save with `save_document_as` instead
+    pub fn save_document(document: &CanvasDocument, name: &str) {
+        let doc = document.clone();
+        let default_name = format!("{}.json", name);
         std::thread::spawn(move || {
             let dialog = rfd::FileDialog::new()
                 .set_title("Save Document")
-                .set_file_name(format!("{name}.json"))
+                .set_file_name(&default_name)
                 .add_filter("DrafftInk Document", &["json"]);
-            if let Some(mut path) = dialog.save_file() {
-                if path.extension().is_none() {
-                    path.set_extension("json");
-                }
-                match write_document(&document, &path) {
-                    Ok(()) => {
-                        if let Ok(mut saves) = PENDING_SAVES.lock() {
-                            saves.push((tab_id, path, revision));
+
+            if let Some(path) = dialog.save_file() {
+                match doc.to_json() {
+                    Ok(json) => {
+                        if let Err(e) = std::fs::write(&path, &json) {
+                            log::error!("Failed to write file: {}", e);
+                        } else {
+                            log::info!("Saved document to: {:?}", path);
                         }
-                        wake();
                     }
-                    Err(e) => log::error!("Failed to save {path:?}: {e}"),
+                    Err(e) => log::error!("Failed to serialize document: {}", e),
                 }
             }
         });
     }
 
-    /// Take saves finished from a file dialog: (tab id, file, revision).
-    pub fn take_pending_saves() -> Vec<(u64, PathBuf, u64)> {
-        PENDING_SAVES
-            .lock()
-            .map(|mut saves| std::mem::take(&mut *saves))
-            .unwrap_or_default()
-    }
-
-    /// Choose a document file and load it (async, non-blocking). Use
-    /// `take_pending_open()` to retrieve the result.
+    /// Load document from a JSON file using native file dialog (async, non-blocking).
+    /// Use `take_pending_document()` to retrieve the result.
+    /// Load document from a JSON file using native file dialog (async, non-blocking).
+    /// Use `take_pending_document()` to retrieve the result.
     pub fn load_document() {
         std::thread::spawn(move || {
             let dialog = rfd::FileDialog::new()
@@ -170,8 +131,8 @@ pub mod file_ops {
         });
     }
 
-    /// Take a document loaded by `load_document()`, with its file.
-    pub fn take_pending_open() -> Option<(CanvasDocument, Option<PathBuf>)> {
+    /// Take pending document from async load operation, with its file.
+    pub fn take_pending_document() -> Option<(CanvasDocument, Option<PathBuf>)> {
         PENDING_DOCUMENT.lock().ok().and_then(|mut p| p.take())
     }
 
@@ -1618,21 +1579,6 @@ struct TabState {
     close_after_save: bool,
 }
 
-impl TabState {
-    fn new(name: String, document: drafftink_core::canvas::CanvasDocument) -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self {
-            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            name,
-            saved_revision: document.revision(),
-            document,
-            camera: drafftink_core::Camera::new(),
-            path: None,
-            close_after_save: false,
-        }
-    }
-}
-
 /// Runtime state for the application.
 struct AppState {
     // Windowing
@@ -1665,25 +1611,8 @@ struct AppState {
 
     // Text editing state (when editing a text shape)
     text_edit_state: Option<TextEditState>,
-    /// Whether the pointer is over the window (hides the brush outline).
-    pointer_in_window: bool,
-    /// Brush outline opacity; fades with pen hover height when enabled.
-    brush_cursor_opacity: f64,
-    /// UI actions triggered by shortcuts or tablet controls, applied one per
-    /// UI pass.
-    queued_actions: std::collections::VecDeque<QueuedAction>,
-    /// Tablet settings as last saved, to save again when they change.
-    saved_tablet_settings: TabletSettings,
-    /// Keyboard shortcuts as last saved.
-    saved_keybindings: Keybindings,
-    /// Grid and brush preferences as last saved.
-    saved_preferences: Preferences,
-    /// Last "… / back" view command, to undo it if pressed again.
-    view_toggle: Option<ViewToggle>,
-    /// Ignore the next mouse release (its press closed the quick toolbars).
-    suppress_mouse_release: bool,
-    /// Quit after this frame (unsaved changes were dealt with).
-    quit_requested: bool,
+    /// State for this fork's features (see extra.rs).
+    extra: extra::ExtraState,
 
     // Collaboration
     collab: CollaborationManager,
@@ -1850,138 +1779,6 @@ fn add_tab(state: &mut AppState, name: String, document: drafftink_core::canvas:
     load_tab_into_canvas(state, index);
 }
 
-/// The document in tab `index` (the live canvas for the active tab).
-fn tab_document(state: &AppState, index: usize) -> &drafftink_core::canvas::CanvasDocument {
-    if index == state.active_tab {
-        &state.canvas.document
-    } else {
-        &state.tabs[index].document
-    }
-}
-
-/// Whether tab `index` has changes since it was last saved or opened.
-fn tab_is_dirty(state: &AppState, index: usize) -> bool {
-    tab_document(state, index).revision() != state.tabs[index].saved_revision
-}
-
-/// Close a tab, first asking what to do with unsaved changes.
-fn request_close_tab(state: &mut AppState, index: usize) {
-    if index >= state.tabs.len() {
-        return;
-    }
-    if tab_is_dirty(state, index) {
-        state.ui_state.close_prompt = Some(index);
-    } else {
-        close_tab(state, index);
-    }
-}
-
-/// Add `path` to the front of the recent files.
-fn remember_recent(state: &mut AppState, path: std::path::PathBuf) {
-    let recent = &mut state.ui_state.recent_files;
-    recent.retain(|p| p != &path);
-    recent.insert(0, path);
-    recent.truncate(10);
-}
-
-/// Record that tab `index` was saved to `path` at document `revision`; the
-/// tab takes the file's name.
-fn mark_saved(state: &mut AppState, index: usize, path: std::path::PathBuf, revision: u64) {
-    let name = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| state.tabs[index].name.clone());
-    let tab = &mut state.tabs[index];
-    tab.saved_revision = revision;
-    tab.path = Some(path.clone());
-    tab.name = name.clone();
-    tab.document.name = name.clone();
-    if index == state.active_tab {
-        state.canvas.document.name = name;
-    }
-    remember_recent(state, path);
-}
-
-/// Save tab `index` to its file, or (with `save_as`, or before its first
-/// save) to a file chosen in a dialog. Returns true if it was saved now; a
-/// dialog save finishes later (see `file_ops::take_pending_saves`).
-#[cfg(feature = "native")]
-fn save_tab(state: &mut AppState, index: usize, save_as: bool) -> bool {
-    let Some(tab) = state.tabs.get(index) else {
-        return false;
-    };
-    let document = tab_document(state, index).clone();
-    let revision = document.revision();
-    match (&tab.path, save_as) {
-        (Some(path), false) => match file_ops::write_document(&document, path) {
-            Ok(()) => {
-                let path = path.clone();
-                mark_saved(state, index, path, revision);
-                true
-            }
-            Err(e) => {
-                log::error!("Failed to save {path:?}: {e}");
-                false
-            }
-        },
-        _ => {
-            file_ops::save_document_as(document, tab.name.clone(), tab.id, revision);
-            false
-        }
-    }
-}
-
-/// Show an opened document: switching to it if it's already open, in the
-/// current tab if that's an empty new one, otherwise in a new tab; with the
-/// view fitted to its content.
-fn open_document(
-    state: &mut AppState,
-    document: drafftink_core::canvas::CanvasDocument,
-    path: Option<std::path::PathBuf>,
-) {
-    if let Some(path) = &path {
-        if let Some(index) = state
-            .tabs
-            .iter()
-            .position(|t| t.path.as_ref() == Some(path))
-        {
-            switch_to_tab(state, index);
-            remember_recent(state, path.clone());
-            return;
-        }
-    }
-    let name = if document.name.trim().is_empty() {
-        "Untitled".to_string()
-    } else {
-        document.name.clone()
-    };
-    let active = state.active_tab;
-    let reuse = state.canvas.document.is_empty()
-        && state.tabs[active].path.is_none()
-        && !tab_is_dirty(state, active);
-    if reuse {
-        state.tabs[active] = TabState::new(name, document.clone());
-        state.canvas.document = document;
-        state.canvas.clear_selection();
-    } else {
-        add_tab(state, name, document);
-    }
-    let active = state.active_tab;
-    state.tabs[active].saved_revision = state.canvas.document.revision();
-    if let Some(path) = path {
-        state.tabs[active].path = Some(path.clone());
-        remember_recent(state, path);
-    }
-    if let Some(bounds) = state.canvas.document.bounds() {
-        state
-            .canvas
-            .camera
-            .fit_to_bounds(bounds, state.canvas.viewport_size, 50.0);
-    }
-    state.needs_redraw = true;
-    state.window.request_redraw();
-}
-
 /// Close the tab at `index`. Closing the last tab leaves a new empty one.
 fn close_tab(state: &mut AppState, index: usize) {
     if index >= state.tabs.len() {
@@ -2008,19 +1805,6 @@ fn close_tab(state: &mut AppState, index: usize) {
         state.active_tab
     };
     load_tab_into_canvas(state, new_active);
-}
-
-/// A "… / back" view command in effect: the view (camera offset and zoom)
-/// before it ran, and the view it produced once applied.
-struct ViewToggle {
-    command: Command,
-    before: (Vec2, f64),
-    after: Option<(Vec2, f64)>,
-}
-
-/// Whether two views (offset, zoom) are the same, allowing for rounding.
-fn same_view(a: (Vec2, f64), b: (Vec2, f64)) -> bool {
-    (a.0 - b.0).hypot() < 0.5 && (a.1 - b.1).abs() < 1e-6
 }
 
 /// Main application struct.
@@ -2089,479 +1873,6 @@ impl App {
             let mut app = app;
             event_loop.run_app(&mut app).expect("Event loop error");
         }
-    }
-
-    /// Open the quick toolbars at the pointer, or close them if open.
-    pub(crate) fn toggle_quick_toolbars(&mut self) {
-        let Some(state) = &mut self.state else {
-            return;
-        };
-        let now = state.egui_ctx.input(|i| i.time);
-        state.ui_state.quick_bars = match state.ui_state.quick_bars {
-            Some(_) => None,
-            None => Some(crate::ui::QuickBars::new(now)),
-        };
-        state.needs_redraw = true;
-        state.window.request_redraw();
-    }
-
-    /// Run a keyboard (or tablet-mapped) command. Returns false if it
-    /// did nothing because the app isn't ready.
-    fn run_command(&mut self, command: Command, egui_wants_input: bool) -> bool {
-        let Some(state) = &mut self.state else {
-            return false;
-        };
-        if command == Command::QuickToolbars {
-            self.toggle_quick_toolbars();
-            return true;
-        }
-        if command == Command::Cancel && state.ui_state.quick_bars.take().is_some() {
-            state.window.request_redraw();
-            return true;
-        }
-        // "… / back" view commands: pressed again with the view unchanged
-        // since, return to the view before the first press.
-        if let Some(base) = command.view_toggle_base() {
-            let camera = &mut state.canvas.camera;
-            let current = (camera.offset, camera.zoom);
-            if let Some(toggle) = state.view_toggle.take() {
-                if toggle.command == command && toggle.after.is_some_and(|a| same_view(a, current))
-                {
-                    (camera.offset, camera.zoom) = toggle.before;
-                    state.ui_state.zoom_level = camera.zoom;
-                    state.needs_redraw = true;
-                    state.window.request_redraw();
-                    return true;
-                }
-            }
-            state.view_toggle = Some(ViewToggle {
-                command,
-                before: current,
-                after: None,
-            });
-            return self.run_command(base, egui_wants_input);
-        }
-
-        // Commands that are also UI controls run like clicking them.
-        if let Some(action) = command_action(command) {
-            state.queued_actions.push_back(action);
-            state.window.request_redraw();
-            return true;
-        }
-        match command {
-            Command::Tool(tool) => {
-                state.canvas.set_tool(tool);
-                log::info!("Tool: {tool:?}");
-            }
-            Command::Brush(brush) => {
-                state.canvas.set_tool(ToolKind::Freehand);
-                state.canvas.tool_manager.brush = brush;
-                state.needs_redraw = true;
-                state.window.request_redraw();
-                log::info!("Brush: {brush:?}");
-            }
-            Command::Settings => {
-                state.ui_state.settings_open = true;
-            }
-            Command::SelectAll => {
-                state.canvas.select_all();
-                log::info!("Selected all {} shapes", state.canvas.selection.len());
-            }
-            #[cfg(target_arch = "wasm32")]
-            Command::Save => {
-                file_ops::save_document(&state.canvas.document, &state.canvas.document.name);
-            }
-            Command::Open => {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    file_ops::load_document();
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    file_ops::load_document_async();
-                }
-            }
-            Command::ExportPng => {
-                if let Some(render_cx) = self.render_cx.as_ref() {
-                    let device_handle = &render_cx.devices[state.surface.dev_id];
-                    let device = &device_handle.device;
-                    let queue = &device_handle.queue;
-                    let export_scale = state.ui_state.export_scale as f64;
-
-                    let (scene, bounds) = if state.canvas.selection.is_empty() {
-                        state
-                            .shape_renderer
-                            .build_export_scene(&state.canvas.document, export_scale)
-                    } else {
-                        state.shape_renderer.build_export_scene_selection(
-                            &state.canvas.document,
-                            &state.canvas.selection,
-                            export_scale,
-                        )
-                    };
-                    if let Some(bounds) = bounds {
-                        let width = bounds.width().ceil() as u32;
-                        let height = bounds.height().ceil() as u32;
-
-                        log::info!(
-                            "Exporting PNG at {}x scale: {}x{}",
-                            state.ui_state.export_scale,
-                            width,
-                            height
-                        );
-
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            if let Some(result) = render_scene_to_png(
-                                device,
-                                queue,
-                                &mut state.vello_renderer,
-                                &scene,
-                                width,
-                                height,
-                            ) {
-                                let scene_json = state.canvas.document.to_json().ok();
-                                if let Some(png_data) = encode_png(
-                                    &result.rgba_data,
-                                    result.width,
-                                    result.height,
-                                    scene_json.as_deref(),
-                                ) {
-                                    file_ops::export_png(&png_data, &state.canvas.document.name);
-                                }
-                            }
-                        }
-
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            let filename = format!("{}.png", state.canvas.document.name);
-                            let scene_json = state.canvas.document.to_json().ok();
-                            spawn_png_export_async(
-                                device, queue, scene, width, height, filename, false, scene_json,
-                            );
-                        }
-                    } else {
-                        log::info!("Nothing to export - document is empty");
-                    }
-                }
-            }
-            Command::CopyPng => {
-                if let Some(render_cx) = self.render_cx.as_ref() {
-                    let device_handle = &render_cx.devices[state.surface.dev_id];
-                    let device = &device_handle.device;
-                    let queue = &device_handle.queue;
-                    let export_scale = state.ui_state.export_scale as f64;
-
-                    let (scene, bounds) = if state.canvas.selection.is_empty() {
-                        state
-                            .shape_renderer
-                            .build_export_scene(&state.canvas.document, export_scale)
-                    } else {
-                        state.shape_renderer.build_export_scene_selection(
-                            &state.canvas.document,
-                            &state.canvas.selection,
-                            export_scale,
-                        )
-                    };
-
-                    if let Some(bounds) = bounds {
-                        let width = bounds.width().ceil() as u32;
-                        let height = bounds.height().ceil() as u32;
-
-                        log::info!(
-                            "Copying PNG at {}x scale: {}x{}",
-                            state.ui_state.export_scale,
-                            width,
-                            height
-                        );
-
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            if let Some(result) = render_scene_to_png(
-                                device,
-                                queue,
-                                &mut state.vello_renderer,
-                                &scene,
-                                width,
-                                height,
-                            ) {
-                                file_ops::copy_png_to_clipboard(
-                                    &result.rgba_data,
-                                    result.width,
-                                    result.height,
-                                );
-                            }
-                        }
-
-                        #[cfg(target_arch = "wasm32")]
-                        {
-                            spawn_png_export_async(
-                                device,
-                                queue,
-                                scene,
-                                width,
-                                height,
-                                "selection.png".to_string(),
-                                true,
-                                None, // No metadata for clipboard copy
-                            );
-                        }
-                    } else {
-                        log::info!("Nothing to copy - selection is empty");
-                    }
-                }
-            }
-            Command::Undo => {
-                // Undo
-                if state.canvas.document.undo() {
-                    state.canvas.clear_selection();
-                    log::info!("Undo performed");
-                } else {
-                    log::info!("Nothing to undo");
-                }
-            }
-            Command::Redo => {
-                if state.canvas.document.redo() {
-                    state.canvas.clear_selection();
-                    log::info!("Redo performed");
-                } else {
-                    log::info!("Nothing to redo");
-                }
-            }
-            Command::Copy => {
-                if !state.canvas.selection.is_empty() {
-                    let shapes: Vec<Shape> = state
-                        .canvas
-                        .selection
-                        .iter()
-                        .filter_map(|&id| state.canvas.document.get_shape(id).cloned())
-                        .collect();
-                    if let Ok(json) = serde_json::to_string(&shapes) {
-                        state.ui_state.clipboard_shapes = Some(json);
-                        log::info!("Copied {} shapes", shapes.len());
-                    }
-                }
-            }
-            Command::Cut => {
-                if !state.canvas.selection.is_empty() {
-                    let shapes: Vec<Shape> = state
-                        .canvas
-                        .selection
-                        .iter()
-                        .filter_map(|&id| state.canvas.document.get_shape(id).cloned())
-                        .collect();
-                    if let Ok(json) = serde_json::to_string(&shapes) {
-                        state.ui_state.clipboard_shapes = Some(json);
-                        log::info!("Cut {} shapes", shapes.len());
-                        state.canvas.document.push_undo();
-                        for &id in &state.canvas.selection.clone() {
-                            state.canvas.document.remove_shape(id);
-                            if state.collab.is_in_room() {
-                                let _ = state.collab.crdt_mut().remove_shape(&id.to_string());
-                            }
-                        }
-                        state.canvas.clear_selection();
-                    }
-                }
-            }
-            Command::Paste => {
-                // First try to paste shapes from the internal
-                // clipboard, centered on the cursor so pastes
-                // (including across tabs) always land in view.
-                let mut pasted = false;
-                if let Some(json) = &state.ui_state.clipboard_shapes.clone() {
-                    if let Ok(shapes) = serde_json::from_str::<Vec<Shape>>(json) {
-                        let cursor_world = state
-                            .canvas
-                            .camera
-                            .screen_to_world(state.input.mouse_position());
-                        let shapes: Vec<Shape> = shapes
-                            .into_iter()
-                            .map(|mut s| {
-                                s.regenerate_id();
-                                s
-                            })
-                            .collect();
-                        place_shapes_centered_at(
-                            &mut state.canvas,
-                            &mut state.collab,
-                            shapes,
-                            cursor_world,
-                        );
-                        log::info!("Pasted shapes");
-                        pasted = true;
-                    }
-                }
-
-                // Try structured text formats from the
-                // system clipboard (native): Excalidraw
-                // scene JSON first, then Mermaid diagram
-                // source. Both import as native shapes
-                // centered on the mouse cursor.
-                #[cfg(not(target_arch = "wasm32"))]
-                if !pasted {
-                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                        if let Ok(text) = cb.get_text() {
-                            let cursor_world = state
-                                .canvas
-                                .camera
-                                .screen_to_world(state.input.mouse_position());
-                            if let Some(shapes) = drafftink_core::canvas::CanvasDocument::shapes_from_excalidraw_clipboard(&text) {
-                                place_shapes_centered_at(
-                                    &mut state.canvas,
-                                    &mut state.collab,
-                                    shapes,
-                                    cursor_world,
-                                );
-                                log::info!("Pasted shapes from Excalidraw clipboard");
-                                pasted = true;
-                            } else if let Some(shapes) = drafftink_core::shapes_from_mermaid(&text) {
-                                place_shapes_centered_at(
-                                    &mut state.canvas,
-                                    &mut state.collab,
-                                    shapes,
-                                    cursor_world,
-                                );
-                                log::info!("Imported Mermaid diagram from clipboard");
-                                pasted = true;
-                            }
-                        }
-                    }
-                }
-
-                // If no shapes, try to paste image from system clipboard
-                #[cfg(not(target_arch = "wasm32"))]
-                if !pasted {
-                    if let Some(image_shape) = file_ops::paste_image_from_clipboard(&state.canvas) {
-                        state.canvas.document.push_undo();
-                        state.canvas.clear_selection();
-                        let new_id = image_shape.id();
-                        state.canvas.document.add_shape(image_shape.clone());
-                        state.canvas.add_to_selection(new_id);
-                        if state.collab.is_in_room() {
-                            let _ = state.collab.crdt_mut().add_shape(&image_shape);
-                        }
-                        log::info!("Pasted image from clipboard");
-                    }
-                }
-
-                // WASM: Try Excalidraw clipboard text first, then image
-                #[cfg(target_arch = "wasm32")]
-                if !pasted {
-                    let cursor_world = state
-                        .canvas
-                        .camera
-                        .screen_to_world(state.input.mouse_position());
-                    file_ops::paste_shapes_from_clipboard_async(cursor_world);
-                    let vw = state.canvas.viewport_size.width;
-                    let vh = state.canvas.viewport_size.height;
-                    let cox = state.canvas.camera.offset.x;
-                    let coy = state.canvas.camera.offset.y;
-                    let cz = state.canvas.camera.zoom;
-                    file_ops::paste_image_from_clipboard_async(vw, vh, cox, coy, cz);
-                }
-            }
-            Command::Duplicate => {
-                if !state.canvas.selection.is_empty() {
-                    state.canvas.document.push_undo();
-                    let mut new_selection = Vec::new();
-                    for &id in &state.canvas.selection.clone() {
-                        if let Some(shape) = state.canvas.document.get_shape(id) {
-                            let mut new_shape = shape.clone();
-                            new_shape.regenerate_id();
-                            new_shape
-                                .transform(kurbo::Affine::translate(kurbo::Vec2::new(20.0, 20.0)));
-                            let new_id = new_shape.id();
-                            state.canvas.document.add_shape(new_shape.clone());
-                            new_selection.push(new_id);
-                            if state.collab.is_in_room() {
-                                let _ = state.collab.crdt_mut().add_shape(&new_shape);
-                            }
-                        }
-                    }
-                    state.canvas.clear_selection();
-                    for id in new_selection {
-                        state.canvas.add_to_selection(id);
-                    }
-                    log::info!("Duplicated shapes");
-                }
-            }
-            Command::Group => {
-                // Group
-                if let Some(group_id) = state.canvas.group_selected() {
-                    log::info!("Grouped shapes into {:?}", group_id);
-                } else {
-                    log::info!("Select at least 2 shapes to group");
-                }
-            }
-            Command::Ungroup => {
-                // Ungroup
-                let ungrouped = state.canvas.ungroup_selected();
-                if !ungrouped.is_empty() {
-                    log::info!("Ungrouped {} shapes", ungrouped.len());
-                } else {
-                    log::info!("No groups to ungroup");
-                }
-            }
-            Command::Delete => {
-                if !state.canvas.selection.is_empty() {
-                    state.canvas.document.push_undo();
-                    state.canvas.delete_selected();
-                }
-            }
-            Command::Cancel => {
-                // Skip if egui is handling this (e.g., closing its own dialogs)
-                if egui_wants_input {
-                    return true;
-                }
-                // First, close any open dialogs/popovers
-                let had_open_dialog = state.ui_state.color_popover != crate::ui::ColorPopover::None
-                    || state.ui_state.menu_open
-                    || state.ui_state.collab_modal_open
-                    || state.ui_state.settings_open
-                    || state.ui_state.save_dialog_open
-                    || state.ui_state.open_dialog_open
-                    || state.ui_state.open_recent_dialog_open;
-
-                if had_open_dialog {
-                    state.ui_state.color_popover = crate::ui::ColorPopover::None;
-                    state.ui_state.menu_open = false;
-                    state.ui_state.collab_modal_open = false;
-                    state.ui_state.settings_open = false;
-                    state.ui_state.key_capture = None;
-                    state.ui_state.save_dialog_open = false;
-                    state.ui_state.open_dialog_open = false;
-                    state.ui_state.open_recent_dialog_open = false;
-                } else {
-                    // No dialog open - switch to Select tool
-                    state.canvas.tool_manager.cancel();
-                    state.canvas.clear_selection();
-                    state.canvas.set_tool(ToolKind::Select);
-                    state.ui_state.current_tool = ToolKind::Select;
-                }
-            }
-            Command::NudgeUp | Command::NudgeDown | Command::NudgeLeft | Command::NudgeRight => {
-                let direction = match command {
-                    Command::NudgeUp => kurbo::Vec2::new(0.0, -1.0),
-                    Command::NudgeDown => kurbo::Vec2::new(0.0, 1.0),
-                    Command::NudgeLeft => kurbo::Vec2::new(-1.0, 0.0),
-                    _ => kurbo::Vec2::new(1.0, 0.0),
-                };
-                if !state.canvas.selection.is_empty() {
-                    use drafftink_core::GRID_SIZE;
-                    let delta = direction * GRID_SIZE;
-                    state.canvas.document.push_undo();
-                    let translation = kurbo::Affine::translate(delta);
-                    for &id in &state.canvas.selection {
-                        if let Some(shape) = state.canvas.document.get_shape_mut(id) {
-                            shape.transform(translation);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        true
     }
 
     /// Finish initialization after surface is created.
@@ -2637,15 +1948,7 @@ impl App {
             config: self.config.clone(),
             event_handler: EventHandler::new(),
             text_edit_state: None,
-            queued_actions: std::collections::VecDeque::new(),
-            saved_tablet_settings: TabletSettings::default(),
-            saved_keybindings: Keybindings::default(),
-            saved_preferences: Preferences::default(),
-            view_toggle: None,
-            suppress_mouse_release: false,
-            quit_requested: false,
-            pointer_in_window: false,
-            brush_cursor_opacity: 1.0,
+            extra: extra::ExtraState::default(),
             collab: CollaborationManager::new(),
             websocket: None,
             remote_peers: std::collections::HashMap::new(),
@@ -2657,53 +1960,7 @@ impl App {
         });
 
         if let Some(state) = &mut self.state {
-            let settings = TabletSettings::load();
-            state.ui_state.tablet_settings = settings.clone();
-            state.saved_tablet_settings = settings;
-            let keybindings = Keybindings::load();
-            state.ui_state.keybindings = keybindings.clone();
-            state.saved_keybindings = keybindings;
-            let preferences = Preferences::load();
-            state.config.grid_style = preferences.grid_style;
-            state.ui_state.grid_style = preferences.grid_style;
-            state.ui_state.writing_guides = preferences.writing_guides;
-            state.canvas.tool_manager.brush = preferences.brush;
-            state.canvas.tool_manager.nib_angle = preferences.nib_angle;
-            state.ui_state.recent_files = preferences.recent_files.clone();
-            // Reopen the documents open last time instead of the intro.
-            #[cfg(feature = "native")]
-            {
-                let documents: Vec<_> = preferences
-                    .open_documents
-                    .iter()
-                    .filter_map(|path| match file_ops::read_document(path) {
-                        Ok(doc) => Some((doc, path.clone())),
-                        Err(e) => {
-                            log::warn!("Couldn't reopen {path:?}: {e}");
-                            None
-                        }
-                    })
-                    .collect();
-                if !documents.is_empty() {
-                    state.canvas.document = drafftink_core::canvas::CanvasDocument::new();
-                    for (doc, path) in documents {
-                        log::info!("Reopened {path:?}");
-                        open_document(state, doc, Some(path));
-                    }
-                    let active = preferences.active_document.as_ref().and_then(|path| {
-                        state
-                            .tabs
-                            .iter()
-                            .position(|t| t.path.as_ref() == Some(path))
-                    });
-                    if let Some(index) = active {
-                        switch_to_tab(state, index);
-                    }
-                    // Reopening isn't a change: keep the recent files order.
-                    state.ui_state.recent_files = preferences.recent_files.clone();
-                }
-            }
-            state.saved_preferences = preferences;
+            extra::load_settings(state);
         }
 
         self.pending_window = None;
@@ -2844,18 +2101,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        #[cfg(target_os = "linux")]
-        if let Some(proxy) = self.tablet_proxy.take() {
-            crate::tablet_evdev::spawn(proxy.clone());
-            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-            if let Ok(handle) = event_loop.display_handle() {
-                if let RawDisplayHandle::Wayland(wayland) = handle.as_raw() {
-                    // SAFETY: winit keeps its wl_display connected for the
-                    // lifetime of the event loop.
-                    unsafe { crate::tablet::spawn(wayland.display.as_ptr(), proxy) };
-                }
-            }
-        }
+        self.start_tablet_input(event_loop);
 
         log::info!("Creating window...");
 
@@ -3118,19 +2364,7 @@ impl ApplicationHandler<UserEvent> for App {
 
                 // Check for pending document from async file load
                 #[cfg(feature = "native")]
-                {
-                    if let Some((doc, path)) = file_ops::take_pending_open() {
-                        open_document(state, doc, path);
-                    }
-                    for (tab_id, path, revision) in file_ops::take_pending_saves() {
-                        if let Some(index) = state.tabs.iter().position(|t| t.id == tab_id) {
-                            mark_saved(state, index, path, revision);
-                            if std::mem::take(&mut state.tabs[index].close_after_save) {
-                                close_tab(state, index);
-                            }
-                        }
-                    }
-                }
+                documents::take_file_results(state);
                 #[cfg(target_arch = "wasm32")]
                 if let Some(doc) = file_ops::take_pending_document() {
                     open_document(state, doc, None);
@@ -3453,7 +2687,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let egui_output = state.egui_ctx.run(egui_input, |ctx| {
                     if let Some(action) = render_ui(ctx, &mut state.ui_state, &selected_props)
                         .or_else(|| {
-                            let queued = state.queued_actions.pop_front()?;
+                            let queued = state.extra.queued_actions.pop_front()?;
                             Some(resolve_queued_action(queued, &state.ui_state))
                         })
                     {
@@ -3700,23 +2934,6 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             UiAction::SwitchTab(_)
                             | UiAction::CloseTab(_)
-                            | UiAction::CloseActiveTab
-                            | UiAction::ForceCloseTab(_)
-                            | UiAction::SaveAndCloseTab(_)
-                            | UiAction::CloseOtherTabs(_)
-                            | UiAction::Save
-                            | UiAction::SaveAs
-                            | UiAction::SaveTab(_)
-                            | UiAction::SaveTabAs(_)
-                            | UiAction::RenameTab(..)
-                            | UiAction::NextTab
-                            | UiAction::PreviousTab
-                            | UiAction::OpenFile
-                            | UiAction::OpenPath(_)
-                            | UiAction::QuitDiscard
-                            | UiAction::SaveAllAndQuit
-                            | UiAction::ShowPractice(_)
-                            | UiAction::NewDocument
                             | UiAction::LoadLibrary => {
                                 // Tab operations need exclusive access to the
                                 // whole AppState, which the egui closure cannot
@@ -3755,47 +2972,6 @@ impl ApplicationHandler<UserEvent> for App {
                             UiAction::ToggleGrid => {
                                 state.config.grid_style = state.config.grid_style.next();
                                 state.ui_state.grid_style = state.config.grid_style;
-                            }
-                            UiAction::SetGridStyle(style) => {
-                                state.config.grid_style = style;
-                                state.ui_state.grid_style = style;
-                            }
-                            UiAction::SetBrush(_) | UiAction::SetNibAngle(_) => {
-                                // Selected pen strokes change; with none
-                                // selected it's the brush for new strokes.
-                                let selected: Vec<_> = state.canvas.selection.clone();
-                                let mut changed = false;
-                                for shape_id in selected {
-                                    if let Some(Shape::Freehand(freehand)) =
-                                        state.canvas.document.get_shape_mut(shape_id)
-                                    {
-                                        match action {
-                                            UiAction::SetBrush(brush) => freehand.brush = brush,
-                                            UiAction::SetNibAngle(angle) => {
-                                                freehand.nib_angle = angle
-                                            }
-                                            _ => {}
-                                        }
-                                        changed = true;
-                                    }
-                                }
-                                if changed {
-                                    broadcast_doc_changes(
-                                        &mut state.collab,
-                                        &state.canvas.document,
-                                        state.websocket.as_ref(),
-                                    );
-                                } else {
-                                    match action {
-                                        UiAction::SetBrush(brush) => {
-                                            state.canvas.tool_manager.brush = brush
-                                        }
-                                        UiAction::SetNibAngle(angle) => {
-                                            state.canvas.tool_manager.nib_angle = angle
-                                        }
-                                        _ => {}
-                                    }
-                                }
                             }
                             UiAction::ZoomIn => {
                                 let center = kurbo::Point::new(
@@ -4583,6 +3759,9 @@ impl ApplicationHandler<UserEvent> for App {
                                     log::info!("Updated math LaTeX");
                                 }
                             }
+                            // This fork's own actions, run after the egui pass
+                            // (see actions.rs).
+                            action => tab_action = Some(action),
                         }
                     }
                 });
@@ -4600,188 +3779,18 @@ impl ApplicationHandler<UserEvent> for App {
                     match action {
                         UiAction::SwitchTab(i) => switch_to_tab(state, i),
                         UiAction::CloseTab(i) => request_close_tab(state, i),
-                        UiAction::CloseActiveTab => request_close_tab(state, state.active_tab),
-                        UiAction::ForceCloseTab(i) => close_tab(state, i),
-                        UiAction::CloseOtherTabs(keep) => {
-                            // Close the clean ones; ask about the first with
-                            // unsaved changes (the rest stay open).
-                            let mut keep = keep;
-                            for i in (0..state.tabs.len()).rev() {
-                                if i != keep && !tab_is_dirty(state, i) {
-                                    close_tab(state, i);
-                                    if i < keep {
-                                        keep -= 1;
-                                    }
-                                }
-                            }
-                            switch_to_tab(state, keep);
-                            state.ui_state.close_prompt = (0..state.tabs.len())
-                                .find(|&i| i != keep && tab_is_dirty(state, i));
-                        }
-                        UiAction::NextTab | UiAction::PreviousTab => {
-                            let n = state.tabs.len();
-                            let step = if matches!(action, UiAction::NextTab) {
-                                1
-                            } else {
-                                n - 1
-                            };
-                            switch_to_tab(state, (state.active_tab + step) % n);
-                        }
-                        UiAction::RenameTab(i, name) => {
-                            if let Some(tab) = state.tabs.get_mut(i) {
-                                tab.name = name.clone();
-                                tab.document.name = name.clone();
-                            }
-                            if i == state.active_tab {
-                                state.canvas.document.name = name;
-                            }
-                        }
-                        #[cfg(feature = "native")]
-                        UiAction::Save => {
-                            save_tab(state, state.active_tab, false);
-                        }
-                        #[cfg(feature = "native")]
-                        UiAction::SaveAs => {
-                            save_tab(state, state.active_tab, true);
-                        }
-                        #[cfg(feature = "native")]
-                        UiAction::SaveTab(i) => {
-                            save_tab(state, i, false);
-                        }
-                        #[cfg(feature = "native")]
-                        UiAction::SaveTabAs(i) => {
-                            save_tab(state, i, true);
-                        }
-                        #[cfg(feature = "native")]
-                        UiAction::SaveAndCloseTab(i) => {
-                            if save_tab(state, i, false) {
-                                close_tab(state, i);
-                            } else if let Some(tab) = state.tabs.get_mut(i) {
-                                // Closes once saved from the file dialog.
-                                tab.close_after_save = true;
-                            }
-                        }
-                        #[cfg(feature = "native")]
-                        UiAction::OpenFile => file_ops::load_document(),
-                        #[cfg(feature = "native")]
-                        UiAction::OpenPath(path) => match file_ops::read_document(&path) {
-                            Ok(doc) => open_document(state, doc, Some(path)),
-                            Err(e) => {
-                                log::error!("Couldn't open {path:?}: {e}");
-                                state.ui_state.recent_files.retain(|p| p != &path);
-                            }
-                        },
-                        #[cfg(feature = "native")]
-                        UiAction::SaveAllAndQuit => {
-                            let dirty: Vec<usize> = (0..state.tabs.len())
-                                .filter(|&i| tab_is_dirty(state, i))
-                                .collect();
-                            let saved_all = dirty.into_iter().all(|i| save_tab(state, i, false));
-                            if saved_all {
-                                state.quit_requested = true;
-                            }
-                        }
-                        #[cfg(target_arch = "wasm32")]
-                        UiAction::Save => {
-                            file_ops::save_document(
-                                &state.canvas.document,
-                                &state.canvas.document.name,
-                            );
-                        }
-                        UiAction::QuitDiscard => state.quit_requested = true,
                         UiAction::LoadLibrary => file_ops::load_excalidrawlib_async(),
-                        UiAction::NewDocument => {
-                            // "Untitled", or "Untitled 2", 3... if taken.
-                            let name = (1..)
-                                .map(|n| match n {
-                                    1 => "Untitled".to_string(),
-                                    n => format!("Untitled {n}"),
-                                })
-                                .find(|name| state.tabs.iter().all(|t| &t.name != name))
-                                .unwrap_or_default();
-                            let mut doc = drafftink_core::canvas::CanvasDocument::new();
-                            doc.name = name.clone();
-                            add_tab(state, name, doc);
-                            log::info!("New document");
-                        }
-                        UiAction::ShowPractice(sheet) => {
-                            // Its own tab (reused if still open), on the
-                            // guide lines the letters were laid out on.
-                            let title = sheet.title();
-                            match state.tabs.iter().position(|t| t.name == title) {
-                                Some(index) => switch_to_tab(state, index),
-                                None => {
-                                    let mut doc = sheet.build();
-                                    doc.name = title.clone();
-                                    add_tab(state, title.clone(), doc);
-                                    state.canvas.camera.reset();
-                                }
-                            }
-                            let guides = sheet.guides();
-                            state.ui_state.writing_guides = drafftink_render::WritingGuides {
-                                x_height: guides.x_height,
-                                ascender: guides.ascender,
-                                descender: guides.descender,
-                                row_gap: guides.row_gap,
-                                slant: guides.slant,
-                            };
-                            let style = match sheet.kind() {
-                                drafftink_core::practice::SheetKind::Handwriting => {
-                                    GridStyle::Handwriting
-                                }
-                                drafftink_core::practice::SheetKind::Calligraphy => {
-                                    GridStyle::Calligraphy
-                                }
-                            };
-                            state.config.grid_style = style;
-                            state.ui_state.grid_style = style;
-                            log::info!("Opened {title}");
-                        }
-                        _ => {}
+                        action => actions::handle(state, action),
                     }
                     state.needs_redraw = true;
                 }
-                if state.quit_requested {
+                if state.extra.quit_requested {
                     event_loop.exit();
                     return;
                 }
+                extra::after_ui_pass(state);
 
                 // Handle deferred actions that need render_cx access
-                // Persist tablet settings edited in the settings window, and
-                // keep applying queued actions (one per UI pass).
-                if state.ui_state.tablet_settings != state.saved_tablet_settings {
-                    state.ui_state.tablet_settings.save();
-                    state.saved_tablet_settings = state.ui_state.tablet_settings.clone();
-                }
-                if state.ui_state.keybindings != state.saved_keybindings {
-                    state.ui_state.keybindings.save();
-                    state.saved_keybindings = state.ui_state.keybindings.clone();
-                }
-                let preferences = Preferences {
-                    grid_style: state.config.grid_style,
-                    writing_guides: state.ui_state.writing_guides,
-                    brush: state.canvas.tool_manager.brush,
-                    nib_angle: state.canvas.tool_manager.nib_angle,
-                    open_documents: state.tabs.iter().filter_map(|t| t.path.clone()).collect(),
-                    active_document: state.tabs[state.active_tab].path.clone(),
-                    recent_files: state.ui_state.recent_files.clone(),
-                };
-                if preferences != state.saved_preferences {
-                    preferences.save();
-                    state.saved_preferences = preferences;
-                }
-                if !state.queued_actions.is_empty() {
-                    state.window.request_redraw();
-                }
-                // Once a "… / back" command's view change has been applied,
-                // remember the resulting view.
-                if let Some(toggle) = &mut state.view_toggle {
-                    if toggle.after.is_none() && state.queued_actions.is_empty() {
-                        let camera = &state.canvas.camera;
-                        toggle.after = Some((camera.offset, camera.zoom));
-                    }
-                }
-
                 if let Some(action) = deferred_action {
                     if let Some(render_cx) = self.render_cx.as_ref() {
                         let device_handle = &render_cx.devices[state.surface.dev_id];
@@ -4968,33 +3977,7 @@ impl ApplicationHandler<UserEvent> for App {
                     None
                 };
 
-                // Brush outline at full-pressure width while hovering with a
-                // drawing tool over the canvas
-                let brush_cursor = {
-                    let tool = state.canvas.tool_manager.current_tool;
-                    let drawing_tool = matches!(tool, ToolKind::Freehand | ToolKind::Highlighter);
-                    if drawing_tool
-                        && !state.canvas.tool_manager.is_active()
-                        && !state.egui_ctx.is_pointer_over_area()
-                        && state.pointer_in_window
-                    {
-                        let mut stroke_width = state.ui_state.stroke_width as f64;
-                        if tool == ToolKind::Highlighter {
-                            stroke_width = stroke_width.max(12.0);
-                        }
-                        let world = state
-                            .canvas
-                            .camera
-                            .screen_to_world(state.input.mouse_position());
-                        Some((
-                            world,
-                            drafftink_core::shapes::pressure_width(stroke_width, 1.0),
-                            state.brush_cursor_opacity,
-                        ))
-                    } else {
-                        None
-                    }
-                };
+                let brush_cursor = extra::brush_cursor(state);
 
                 // Get laser pointer info
                 let laser_pointer =
@@ -5232,17 +4215,17 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::CursorEntered { .. } => {
-                state.pointer_in_window = true;
+                state.extra.pointer_in_window = true;
             }
 
             WindowEvent::CursorLeft { .. } => {
-                state.pointer_in_window = false;
+                state.extra.pointer_in_window = false;
                 state.needs_redraw = true;
                 state.window.request_redraw();
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                state.pointer_in_window = true;
+                state.extra.pointer_in_window = true;
                 let point = Point::new(position.x, position.y);
 
                 // Skip canvas processing if egui wants the pointer
@@ -5405,16 +4388,7 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // A press outside the quick toolbars just closes them.
-                if btn_state == ElementState::Pressed && state.ui_state.quick_bars.is_some() {
-                    state.ui_state.quick_bars = None;
-                    state.suppress_mouse_release = true;
-                    state.window.request_redraw();
-                    return;
-                }
-                if btn_state == ElementState::Released
-                    && std::mem::take(&mut state.suppress_mouse_release)
-                {
+                if commands::intercept_mouse_button(state, btn_state) {
                     return;
                 }
 
@@ -5693,51 +4667,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
-                // Capturing a new shortcut in the settings: the next key
-                // press (with modifiers) becomes the binding.
-                if state.ui_state.key_capture.is_some() && event.state == ElementState::Pressed {
-                    let chord = KeyChord::from_event(
-                        &event,
-                        state.input.ctrl(),
-                        state.input.shift(),
-                        state.input.alt(),
-                    );
-                    if let (Some(chord), Some(command)) = (chord, state.ui_state.key_capture) {
-                        state.ui_state.key_capture = None;
-                        let label = chord.label();
-                        state.ui_state.key_capture_note = state
-                            .ui_state
-                            .keybindings
-                            .bind(command, chord)
-                            .map(|previous| {
-                                format!("{label} was moved from \"{}\"", previous.label())
-                            });
-                    }
-                    state.window.request_redraw();
+                if commands::intercept_key(state, &event) {
                     return;
-                }
-
-                // The quick toolbars key toggles them even with the pointer
-                // over the toolbars it opened (unless typing in a text field).
-                if state.event_handler.editing_text.is_none()
-                    && event.state == ElementState::Pressed
-                    && !state.egui_ctx.wants_keyboard_input()
-                {
-                    let chord = KeyChord::from_event(
-                        &event,
-                        state.input.ctrl(),
-                        state.input.shift(),
-                        state.input.alt(),
-                    );
-                    if chord.is_some_and(|chord| {
-                        state.ui_state.keybindings.command_for(&chord)
-                            == Some(Command::QuickToolbars)
-                    }) {
-                        if !event.repeat {
-                            self.toggle_quick_toolbars();
-                        }
-                        return;
-                    }
                 }
 
                 // Skip canvas processing if egui wants keyboard

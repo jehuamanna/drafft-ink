@@ -97,6 +97,24 @@ fn angle_delta(from: f64, to: f64) -> f64 {
 }
 
 impl App {
+    /// Start listening for tablet input, once the display connection exists.
+    pub(super) fn start_tablet_input(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "linux")]
+        if let Some(proxy) = self.tablet_proxy.take() {
+            crate::tablet_evdev::spawn(proxy.clone());
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            if let Ok(handle) = event_loop.display_handle() {
+                if let RawDisplayHandle::Wayland(wayland) = handle.as_raw() {
+                    // SAFETY: winit keeps its wl_display connected for the
+                    // lifetime of the event loop.
+                    unsafe { crate::tablet::spawn(wayland.display.as_ptr(), proxy) };
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = event_loop;
+    }
+
     /// Handle a tablet event: pen input becomes the equivalent mouse events
     /// (so the canvas and UI work with the pen), with pressure passed to the
     /// freehand tools; buttons, ring, strip and pinch run their configured
@@ -272,7 +290,7 @@ impl App {
             self.pen.pen_tools.insert(self.pen.pen.serial, tool);
         }
         if let Some(state) = &mut self.state {
-            state.brush_cursor_opacity = 1.0;
+            state.extra.brush_cursor_opacity = 1.0;
         }
         if self.pen.down {
             self.pen_up(event_loop);
@@ -342,7 +360,7 @@ impl App {
             self.pen.pressure = pressure;
         }
 
-        state.brush_cursor_opacity =
+        state.extra.brush_cursor_opacity =
             if settings.hover_fade && self.pen.pen.has_distance && !self.pen.down {
                 (1.0 - sample.distance).clamp(0.15, 1.0)
             } else {
@@ -516,9 +534,11 @@ impl App {
                 .camera
                 .pan(Vec2::new(-40.0 * steps as f64, 0.0)),
             RingAction::StrokeWidth => state
+                .extra
                 .queued_actions
                 .push_back(QueuedAction::StepWidth(steps as isize)),
             RingAction::StrokeColor => state
+                .extra
                 .queued_actions
                 .push_back(QueuedAction::CycleColor(steps as isize)),
             RingAction::UndoRedo => {
@@ -529,6 +549,7 @@ impl App {
                 };
                 for _ in 0..steps.unsigned_abs() {
                     state
+                        .extra
                         .queued_actions
                         .push_back(QueuedAction::Ui(action.clone()));
                 }
