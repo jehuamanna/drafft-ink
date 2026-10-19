@@ -91,6 +91,8 @@ pub struct ToolManager {
     pub calligraphy_mode: bool,
     /// Pressure simulation mode (varies width based on speed).
     pub pressure_simulation: bool,
+    /// Real pressure from a stylus (0.0-1.0); overrides simulated pressure.
+    pub stylus_pressure: Option<f64>,
     /// MSD brush position (mass position).
     msd_pos: Point,
     /// MSD brush velocity.
@@ -111,6 +113,7 @@ impl Default for ToolManager {
             corner_radius: 0.0,
             calligraphy_mode: false,
             pressure_simulation: false,
+            stylus_pressure: None,
             msd_pos: Point::ZERO,
             msd_vel: Point::ZERO,
         }
@@ -136,7 +139,9 @@ impl ToolManager {
             self.freehand_points.clear();
             self.freehand_pressures.clear();
             self.freehand_points.push(point);
-            self.freehand_pressures.push(1.0); // Start with full pressure
+            // Start with full pressure unless a stylus tells us otherwise
+            self.freehand_pressures
+                .push(self.stylus_pressure.unwrap_or(1.0));
             self.last_point_time = Some(Instant::now());
             self.last_point_pos = Some(point);
             self.smoothed_pressure = 1.0;
@@ -203,6 +208,9 @@ impl ToolManager {
     /// Compute pressure based on drawing velocity.
     /// Fast movement = low pressure (thin line), slow movement = high pressure (thick line).
     fn compute_pressure(&mut self, point: Point) -> f64 {
+        if let Some(pressure) = self.stylus_pressure {
+            return pressure;
+        }
         if !self.pressure_simulation {
             return 1.0;
         }

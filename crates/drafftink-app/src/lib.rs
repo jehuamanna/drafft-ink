@@ -6,6 +6,7 @@
 mod app;
 mod event_handler;
 mod shortcuts;
+mod tablet;
 mod ui;
 
 pub use app::{App, AppConfig};

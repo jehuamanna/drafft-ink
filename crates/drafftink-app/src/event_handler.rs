@@ -738,7 +738,7 @@ impl EventHandler {
                     // Always use pressure data for consistent rendering
                     let mut freehand =
                         Freehand::from_points_with_pressure(points.to_vec(), pressures.to_vec());
-                    freehand.simplify(2.0); // Simplify the path
+                    freehand.simplify(0.5); // Drop redundant points, keep the curve shape
                     freehand.style = current_style.clone(); // Apply current style
                     canvas.document.push_undo();
                     canvas.document.add_shape(Shape::Freehand(freehand));
@@ -752,7 +752,7 @@ impl EventHandler {
                     // Always use pressure data for consistent rendering
                     let mut freehand =
                         Freehand::from_points_with_pressure(points.to_vec(), pressures.to_vec());
-                    freehand.simplify(2.0);
+                    freehand.simplify(0.5);
                     // Highlighter: wider stroke, semi-transparent
                     freehand.style = current_style.clone();
                     freehand.style.stroke_width = current_style.stroke_width.max(12.0);

@@ -21,12 +21,13 @@ use vello::{AaConfig, RenderParams, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::event_handler::EventHandler;
+use crate::tablet::{TabletEvent, UserEvent};
 use crate::ui::{SelectedShapeProps, UiAction, UiState, render_ui};
 
 #[cfg(feature = "native")]
@@ -1778,6 +1779,14 @@ pub struct App {
     startup_server: Option<String>,
     /// Room to auto-join on startup (from CLI args).
     startup_room: Option<String>,
+    /// Handed to the tablet listener once the display connection exists.
+    tablet_proxy: Option<EventLoopProxy<UserEvent>>,
+    /// Latest stylus pressure (0.0-1.0) reported by the tablet.
+    stylus_pressure: f64,
+    /// Whether the stylus tip is currently touching the tablet.
+    stylus_down: bool,
+    /// Tool to restore when the pen is flipped back from its eraser end.
+    tool_before_eraser: Option<ToolKind>,
 }
 
 impl App {
@@ -1797,14 +1806,21 @@ impl App {
             init_in_progress: std::cell::Cell::new(false),
             startup_server: None,
             startup_room: None,
+            tablet_proxy: None,
+            stylus_pressure: 1.0,
+            stylus_down: false,
+            tool_before_eraser: None,
         }
     }
 
     /// Run the application, optionally auto-connecting to `server` and
     /// auto-joining `room` on startup (native CLI args; `None` on the web).
     pub async fn run(server: Option<String>, room: Option<String>) {
-        let event_loop = EventLoop::new().expect("Failed to create event loop");
+        let event_loop = EventLoop::<UserEvent>::with_user_event()
+            .build()
+            .expect("Failed to create event loop");
         let mut app = App::new();
+        app.tablet_proxy = Some(event_loop.create_proxy());
         app.startup_server = server;
         app.startup_room = room;
 
@@ -1819,6 +1835,90 @@ impl App {
             let mut app = app;
             event_loop.run_app(&mut app).expect("Event loop error");
         }
+    }
+
+    /// Translate stylus input into the equivalent mouse events, carrying the
+    /// pen pressure to freehand tools via the tool manager.
+    fn handle_tablet_event(&mut self, event_loop: &ActiveEventLoop, event: TabletEvent) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let window_id = state.window.id();
+        let scale = state.window.scale_factor();
+        let device_id = DeviceId::dummy();
+
+        let button_event = |button, pressed: bool| WindowEvent::MouseInput {
+            device_id,
+            state: if pressed {
+                ElementState::Pressed
+            } else {
+                ElementState::Released
+            },
+            button,
+        };
+
+        let window_event = match event {
+            TabletEvent::ProximityIn { eraser } => {
+                // The pen's eraser end selects the eraser; the tip restores the
+                // previous tool unless the user picked another one meanwhile.
+                let current = state.canvas.tool_manager.current_tool;
+                if eraser {
+                    if current != ToolKind::Eraser {
+                        self.tool_before_eraser = Some(current);
+                        state.canvas.set_tool(ToolKind::Eraser);
+                    }
+                } else if let Some(previous) = self.tool_before_eraser.take() {
+                    if current == ToolKind::Eraser {
+                        state.canvas.set_tool(previous);
+                    }
+                }
+                state.needs_redraw = true;
+                state.window.request_redraw();
+                return;
+            }
+            TabletEvent::Motion { x, y, pressure } => {
+                self.stylus_pressure = pressure;
+                if self.stylus_down {
+                    state.canvas.tool_manager.stylus_pressure = Some(pressure);
+                }
+                WindowEvent::CursorMoved {
+                    device_id,
+                    position: winit::dpi::PhysicalPosition::new(x * scale, y * scale),
+                }
+            }
+            TabletEvent::Down => {
+                self.stylus_down = true;
+                state.canvas.tool_manager.stylus_pressure = Some(self.stylus_pressure);
+                button_event(MouseButton::Left, true)
+            }
+            TabletEvent::Up => {
+                self.stylus_down = false;
+                let event = button_event(MouseButton::Left, false);
+                self.window_event(event_loop, window_id, event);
+                if let Some(state) = &mut self.state {
+                    state.canvas.tool_manager.stylus_pressure = None;
+                }
+                return;
+            }
+            TabletEvent::Button { secondary, pressed } => {
+                // Lower barrel button pans like the middle mouse button.
+                let button = if secondary {
+                    MouseButton::Middle
+                } else {
+                    MouseButton::Right
+                };
+                button_event(button, pressed)
+            }
+            TabletEvent::ProximityOut => {
+                if !self.stylus_down {
+                    return;
+                }
+                self.stylus_down = false;
+                state.canvas.tool_manager.stylus_pressure = None;
+                button_event(MouseButton::Left, false)
+            }
+        };
+        self.window_event(event_loop, window_id, window_event);
     }
 
     /// Finish initialization after surface is created.
@@ -2037,10 +2137,22 @@ impl Default for App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() || self.pending_window.is_some() {
             return;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(proxy) = self.tablet_proxy.take() {
+            use winit::raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+            if let Ok(handle) = event_loop.display_handle() {
+                if let RawDisplayHandle::Wayland(wayland) = handle.as_raw() {
+                    // SAFETY: winit keeps its wl_display connected for the
+                    // lifetime of the event loop.
+                    unsafe { crate::tablet::spawn(wayland.display.as_ptr(), proxy) };
+                }
+            }
         }
 
         log::info!("Creating window...");
@@ -5465,6 +5577,12 @@ impl ApplicationHandler for App {
             }
 
             _ => {}
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Tablet(event) => self.handle_tablet_event(event_loop, event),
         }
     }
 

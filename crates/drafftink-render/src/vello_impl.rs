@@ -727,6 +727,10 @@ impl VelloRenderer {
         // Build a filled polygon that represents the variable-width stroke
         let mut left_points: Vec<Point> = Vec::new();
         let mut right_points: Vec<Point> = Vec::new();
+        // Centre point and half width of the first and last outline samples,
+        // used to draw round caps.
+        let mut first_cap: Option<(Point, f64)> = None;
+        let mut last_cap: Option<(Point, f64)> = None;
 
         for i in 0..freehand.points.len() {
             let point = freehand.points[i];
@@ -769,22 +773,25 @@ impl VelloRenderer {
                 point.x - perp.x * half_width,
                 point.y - perp.y * half_width,
             ));
+            first_cap.get_or_insert((point, half_width));
+            last_cap = Some((point, half_width));
         }
 
-        if left_points.is_empty() {
+        let (Some(first_cap), Some(last_cap)) = (first_cap, last_cap) else {
             return;
-        }
+        };
 
-        // Build the path: left side forward, right side backward
+        // Build the path: left side forward, round end cap, right side
+        // backward, round start cap. Sides are smoothed with quadratic curves
+        // through segment midpoints so sparse (simplified) points don't show
+        // as corners.
         let mut path = BezPath::new();
         path.move_to(left_points[0]);
-        for point in left_points.iter().skip(1) {
-            path.line_to(*point);
-        }
-        // Connect to right side (reversed)
-        for point in right_points.iter().rev() {
-            path.line_to(*point);
-        }
+        append_smoothed(&mut path, &left_points);
+        append_round_cap(&mut path, last_cap, left_points[left_points.len() - 1]);
+        right_points.reverse();
+        append_smoothed(&mut path, &right_points);
+        append_round_cap(&mut path, first_cap, right_points[right_points.len() - 1]);
         path.close_path();
 
         // Fill the path (no sloppiness - freehand is already hand-drawn)
@@ -2554,4 +2561,37 @@ mod tests {
         let ctx = RenderContext::new(&canvas, kurbo::Size::new(800.0, 600.0));
         renderer.build_scene(&ctx);
     }
+}
+
+/// Continue `path` (currently at `points[0]`) through `points`, using the
+/// points as quadratic control points and segment midpoints as on-curve points.
+fn append_smoothed(path: &mut BezPath, points: &[Point]) {
+    let n = points.len();
+    if n < 3 {
+        if let Some(&last) = points.get(1) {
+            path.line_to(last);
+        }
+        return;
+    }
+    for i in 1..n - 1 {
+        path.quad_to(points[i], points[i].midpoint(points[i + 1]));
+    }
+    path.line_to(points[n - 1]);
+}
+
+/// Append a half circle around `center` from `from` (on the circle) to the
+/// opposite point, turning clockwise in y-down coordinates.
+fn append_round_cap(path: &mut BezPath, (center, radius): (Point, f64), from: Point) {
+    if radius <= f64::EPSILON {
+        return;
+    }
+    let start_angle = (from - center).atan2();
+    let arc = kurbo::Arc::new(
+        center,
+        kurbo::Vec2::new(radius, radius),
+        start_angle,
+        -std::f64::consts::PI,
+        0.0,
+    );
+    path.extend(arc.append_iter(0.1));
 }
