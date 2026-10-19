@@ -43,31 +43,14 @@ pub mod file_ops {
     use drafftink_core::canvas::CanvasDocument;
     use std::sync::Mutex;
 
-    // Channel for receiving async file operation results
-    static PENDING_DOCUMENT: Mutex<Option<CanvasDocument>> = Mutex::new(None);
+    use std::path::{Path, PathBuf};
+
+    // Channels for receiving async file operation results
+    static PENDING_DOCUMENT: Mutex<Option<(CanvasDocument, Option<PathBuf>)>> = Mutex::new(None);
     static PENDING_LIBRARY: Mutex<Option<(String, CanvasDocument)>> = Mutex::new(None);
-    /// The document file last saved or opened, remembered for the next start.
-    static LAST_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+    /// Saves finished from a file dialog: (tab id, file, document revision).
+    static PENDING_SAVES: Mutex<Vec<(u64, PathBuf, u64)>> = Mutex::new(Vec::new());
 
-    pub fn last_path() -> Option<std::path::PathBuf> {
-        LAST_PATH.lock().ok().and_then(|p| p.clone())
-    }
-
-    pub fn set_last_path(path: std::path::PathBuf) {
-        if let Ok(mut last) = LAST_PATH.lock() {
-            *last = Some(path);
-        }
-    }
-
-    /// Read a saved document, named after its file.
-    pub fn read_document(path: &std::path::Path) -> Result<CanvasDocument, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let mut doc = CanvasDocument::from_json(&content).map_err(|e| e.to_string())?;
-        if let Some(stem) = path.file_stem() {
-            doc.name = stem.to_string_lossy().to_string();
-        }
-        Ok(doc)
-    }
     /// Wakes the event loop when a background file operation finishes, so its
     /// result shows without waiting for the next input event.
     static WAKER: Mutex<Option<winit::event_loop::EventLoopProxy<crate::tablet::UserEvent>>> =
@@ -85,35 +68,64 @@ pub mod file_ops {
         }
     }
 
-    /// Save document to a JSON file using native file dialog (async, non-blocking).
-    pub fn save_document(document: &CanvasDocument, name: &str) {
-        let doc = document.clone();
-        let default_name = format!("{}.json", name);
+    /// Read a saved document, named after its file.
+    pub fn read_document(path: &Path) -> Result<CanvasDocument, String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let mut doc = CanvasDocument::from_json(&content).map_err(|e| e.to_string())?;
+        if let Some(stem) = path.file_stem() {
+            doc.name = stem.to_string_lossy().to_string();
+        }
+        Ok(doc)
+    }
+
+    /// Write a document to `path`. Writes a temporary file first and renames
+    /// it over the old one, so a failed save never leaves a half-written file.
+    pub fn write_document(document: &CanvasDocument, path: &Path) -> Result<(), String> {
+        let json = document.to_json().map_err(|e| e.to_string())?;
+        let mut temp = path.as_os_str().to_owned();
+        temp.push(".saving");
+        let temp = PathBuf::from(temp);
+        std::fs::write(&temp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, path).map_err(|e| e.to_string())?;
+        log::info!("Saved document to: {path:?}");
+        Ok(())
+    }
+
+    /// Ask where to save a tab's document, then save it there (async,
+    /// non-blocking). Finished saves come back from `take_pending_saves()`.
+    pub fn save_document_as(document: CanvasDocument, name: String, tab_id: u64, revision: u64) {
         std::thread::spawn(move || {
             let dialog = rfd::FileDialog::new()
                 .set_title("Save Document")
-                .set_file_name(&default_name)
+                .set_file_name(format!("{name}.json"))
                 .add_filter("DrafftInk Document", &["json"]);
-
-            if let Some(path) = dialog.save_file() {
-                match doc.to_json() {
-                    Ok(json) => {
-                        if let Err(e) = std::fs::write(&path, &json) {
-                            log::error!("Failed to write file: {}", e);
-                        } else {
-                            log::info!("Saved document to: {:?}", path);
-                            set_last_path(path);
-                            wake();
+            if let Some(mut path) = dialog.save_file() {
+                if path.extension().is_none() {
+                    path.set_extension("json");
+                }
+                match write_document(&document, &path) {
+                    Ok(()) => {
+                        if let Ok(mut saves) = PENDING_SAVES.lock() {
+                            saves.push((tab_id, path, revision));
                         }
+                        wake();
                     }
-                    Err(e) => log::error!("Failed to serialize document: {}", e),
+                    Err(e) => log::error!("Failed to save {path:?}: {e}"),
                 }
             }
         });
     }
 
-    /// Load document from a JSON file using native file dialog (async, non-blocking).
-    /// Use `take_pending_document()` to retrieve the result.
+    /// Take saves finished from a file dialog: (tab id, file, revision).
+    pub fn take_pending_saves() -> Vec<(u64, PathBuf, u64)> {
+        PENDING_SAVES
+            .lock()
+            .map(|mut saves| std::mem::take(&mut *saves))
+            .unwrap_or_default()
+    }
+
+    /// Choose a document file and load it (async, non-blocking). Use
+    /// `take_pending_open()` to retrieve the result.
     pub fn load_document() {
         std::thread::spawn(move || {
             let dialog = rfd::FileDialog::new()
@@ -142,11 +154,10 @@ pub mod file_ops {
                                 if let Some(stem) = path.file_stem() {
                                     doc.name = stem.to_string_lossy().to_string();
                                 }
-                                if !is_excalidraw {
-                                    set_last_path(path.clone());
-                                }
+                                // An Excalidraw import isn't saved back to its file.
+                                let path = (!is_excalidraw).then_some(path);
                                 if let Ok(mut pending) = PENDING_DOCUMENT.lock() {
-                                    *pending = Some(doc);
+                                    *pending = Some((doc, path));
                                 }
                                 wake();
                             }
@@ -159,8 +170,8 @@ pub mod file_ops {
         });
     }
 
-    /// Take pending document from async load operation.
-    pub fn take_pending_document() -> Option<CanvasDocument> {
+    /// Take a document loaded by `load_document()`, with its file.
+    pub fn take_pending_open() -> Option<(CanvasDocument, Option<PathBuf>)> {
         PENDING_DOCUMENT.lock().ok().and_then(|mut p| p.take())
     }
 
@@ -1590,12 +1601,36 @@ pub struct RemotePeer {
 /// [`AppState::canvas`]; this snapshot is refreshed whenever the user switches
 /// away, and restored when the tab becomes active again.
 struct TabState {
+    /// Stable identity, for results that arrive later (saves from a dialog).
+    id: u64,
     /// Tab label shown in the tab strip.
     name: String,
     /// The tab's document (authoritative only while the tab is inactive).
     document: drafftink_core::canvas::CanvasDocument,
     /// The tab's camera (pan/zoom), preserved across switches.
     camera: drafftink_core::Camera,
+    /// The file the document is saved in, if any.
+    path: Option<std::path::PathBuf>,
+    /// Document revision when last saved or opened; any other revision means
+    /// unsaved changes.
+    saved_revision: u64,
+    /// Close the tab once a save from the file dialog finishes.
+    close_after_save: bool,
+}
+
+impl TabState {
+    fn new(name: String, document: drafftink_core::canvas::CanvasDocument) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            name,
+            saved_revision: document.revision(),
+            document,
+            camera: drafftink_core::Camera::new(),
+            path: None,
+            close_after_save: false,
+        }
+    }
 }
 
 /// Runtime state for the application.
@@ -1647,6 +1682,8 @@ struct AppState {
     view_toggle: Option<ViewToggle>,
     /// Ignore the next mouse release (its press closed the quick toolbars).
     suppress_mouse_release: bool,
+    /// Quit after this frame (unsaved changes were dealt with).
+    quit_requested: bool,
 
     // Collaboration
     collab: CollaborationManager,
@@ -1808,29 +1845,132 @@ fn switch_to_tab(state: &mut AppState, target: usize) {
 /// Append a new tab holding `document` and make it active.
 fn add_tab(state: &mut AppState, name: String, document: drafftink_core::canvas::CanvasDocument) {
     snapshot_active_tab(state);
-    state.tabs.push(TabState {
-        name,
-        document,
-        camera: drafftink_core::Camera::new(),
-    });
+    state.tabs.push(TabState::new(name, document));
     let index = state.tabs.len() - 1;
     load_tab_into_canvas(state, index);
 }
 
-/// Show an opened document: in the current tab if that's empty, otherwise
-/// in a new tab, with the view fitted to its content.
-fn open_document(state: &mut AppState, document: drafftink_core::canvas::CanvasDocument) {
+/// The document in tab `index` (the live canvas for the active tab).
+fn tab_document(state: &AppState, index: usize) -> &drafftink_core::canvas::CanvasDocument {
+    if index == state.active_tab {
+        &state.canvas.document
+    } else {
+        &state.tabs[index].document
+    }
+}
+
+/// Whether tab `index` has changes since it was last saved or opened.
+fn tab_is_dirty(state: &AppState, index: usize) -> bool {
+    tab_document(state, index).revision() != state.tabs[index].saved_revision
+}
+
+/// Close a tab, first asking what to do with unsaved changes.
+fn request_close_tab(state: &mut AppState, index: usize) {
+    if index >= state.tabs.len() {
+        return;
+    }
+    if tab_is_dirty(state, index) {
+        state.ui_state.close_prompt = Some(index);
+    } else {
+        close_tab(state, index);
+    }
+}
+
+/// Add `path` to the front of the recent files.
+fn remember_recent(state: &mut AppState, path: std::path::PathBuf) {
+    let recent = &mut state.ui_state.recent_files;
+    recent.retain(|p| p != &path);
+    recent.insert(0, path);
+    recent.truncate(10);
+}
+
+/// Record that tab `index` was saved to `path` at document `revision`; the
+/// tab takes the file's name.
+fn mark_saved(state: &mut AppState, index: usize, path: std::path::PathBuf, revision: u64) {
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| state.tabs[index].name.clone());
+    let tab = &mut state.tabs[index];
+    tab.saved_revision = revision;
+    tab.path = Some(path.clone());
+    tab.name = name.clone();
+    tab.document.name = name.clone();
+    if index == state.active_tab {
+        state.canvas.document.name = name;
+    }
+    remember_recent(state, path);
+}
+
+/// Save tab `index` to its file, or (with `save_as`, or before its first
+/// save) to a file chosen in a dialog. Returns true if it was saved now; a
+/// dialog save finishes later (see `file_ops::take_pending_saves`).
+#[cfg(feature = "native")]
+fn save_tab(state: &mut AppState, index: usize, save_as: bool) -> bool {
+    let Some(tab) = state.tabs.get(index) else {
+        return false;
+    };
+    let document = tab_document(state, index).clone();
+    let revision = document.revision();
+    match (&tab.path, save_as) {
+        (Some(path), false) => match file_ops::write_document(&document, path) {
+            Ok(()) => {
+                let path = path.clone();
+                mark_saved(state, index, path, revision);
+                true
+            }
+            Err(e) => {
+                log::error!("Failed to save {path:?}: {e}");
+                false
+            }
+        },
+        _ => {
+            file_ops::save_document_as(document, tab.name.clone(), tab.id, revision);
+            false
+        }
+    }
+}
+
+/// Show an opened document: switching to it if it's already open, in the
+/// current tab if that's an empty new one, otherwise in a new tab; with the
+/// view fitted to its content.
+fn open_document(
+    state: &mut AppState,
+    document: drafftink_core::canvas::CanvasDocument,
+    path: Option<std::path::PathBuf>,
+) {
+    if let Some(path) = &path {
+        if let Some(index) = state
+            .tabs
+            .iter()
+            .position(|t| t.path.as_ref() == Some(path))
+        {
+            switch_to_tab(state, index);
+            remember_recent(state, path.clone());
+            return;
+        }
+    }
     let name = if document.name.trim().is_empty() {
         "Untitled".to_string()
     } else {
         document.name.clone()
     };
-    if state.canvas.document.is_empty() {
-        state.tabs[state.active_tab].name = name;
+    let active = state.active_tab;
+    let reuse = state.canvas.document.is_empty()
+        && state.tabs[active].path.is_none()
+        && !tab_is_dirty(state, active);
+    if reuse {
+        state.tabs[active] = TabState::new(name, document.clone());
         state.canvas.document = document;
         state.canvas.clear_selection();
     } else {
         add_tab(state, name, document);
+    }
+    let active = state.active_tab;
+    state.tabs[active].saved_revision = state.canvas.document.revision();
+    if let Some(path) = path {
+        state.tabs[active].path = Some(path.clone());
+        remember_recent(state, path);
     }
     if let Some(bounds) = state.canvas.document.bounds() {
         state
@@ -1842,9 +1982,15 @@ fn open_document(state: &mut AppState, document: drafftink_core::canvas::CanvasD
     state.window.request_redraw();
 }
 
-/// Close the tab at `index`. The last remaining tab is never closed.
+/// Close the tab at `index`. Closing the last tab leaves a new empty one.
 fn close_tab(state: &mut AppState, index: usize) {
-    if state.tabs.len() <= 1 || index >= state.tabs.len() {
+    if index >= state.tabs.len() {
+        return;
+    }
+    if state.tabs.len() == 1 {
+        let doc = drafftink_core::canvas::CanvasDocument::new();
+        state.tabs[0] = TabState::new("Untitled".to_string(), doc);
+        load_tab_into_canvas(state, 0);
         return;
     }
     // Preserve the active tab's edits unless we are removing it.
@@ -2021,6 +2167,7 @@ impl App {
                 state.canvas.select_all();
                 log::info!("Selected all {} shapes", state.canvas.selection.len());
             }
+            #[cfg(target_arch = "wasm32")]
             Command::Save => {
                 file_ops::save_document(&state.canvas.document, &state.canvas.document.name);
             }
@@ -2481,11 +2628,10 @@ impl App {
             egui_renderer,
             ui_state: UiState::default(),
             canvas,
-            tabs: vec![TabState {
-                name: "Canvas".to_string(),
-                document: drafftink_core::canvas::CanvasDocument::new(),
-                camera: drafftink_core::Camera::new(),
-            }],
+            tabs: vec![TabState::new(
+                "Canvas".to_string(),
+                drafftink_core::canvas::CanvasDocument::new(),
+            )],
             active_tab: 0,
             input: InputState::new(),
             config: self.config.clone(),
@@ -2497,6 +2643,7 @@ impl App {
             saved_preferences: Preferences::default(),
             view_toggle: None,
             suppress_mouse_release: false,
+            quit_requested: false,
             pointer_in_window: false,
             brush_cursor_opacity: 1.0,
             collab: CollaborationManager::new(),
@@ -2522,24 +2669,38 @@ impl App {
             state.ui_state.writing_guides = preferences.writing_guides;
             state.canvas.tool_manager.brush = preferences.brush;
             state.canvas.tool_manager.nib_angle = preferences.nib_angle;
-            // Reopen the last document instead of the intro.
+            state.ui_state.recent_files = preferences.recent_files.clone();
+            // Reopen the documents open last time instead of the intro.
             #[cfg(feature = "native")]
-            if let Some(path) = &preferences.last_document {
-                match file_ops::read_document(path) {
-                    Ok(doc) => {
-                        log::info!("Reopened {path:?}");
-                        state.tabs[0].name = doc.name.clone();
-                        state.canvas.document = doc;
-                        if let Some(bounds) = state.canvas.document.bounds() {
-                            state.canvas.camera.fit_to_bounds(
-                                bounds,
-                                state.canvas.viewport_size,
-                                50.0,
-                            );
+            {
+                let documents: Vec<_> = preferences
+                    .open_documents
+                    .iter()
+                    .filter_map(|path| match file_ops::read_document(path) {
+                        Ok(doc) => Some((doc, path.clone())),
+                        Err(e) => {
+                            log::warn!("Couldn't reopen {path:?}: {e}");
+                            None
                         }
-                        file_ops::set_last_path(path.clone());
+                    })
+                    .collect();
+                if !documents.is_empty() {
+                    state.canvas.document = drafftink_core::canvas::CanvasDocument::new();
+                    for (doc, path) in documents {
+                        log::info!("Reopened {path:?}");
+                        open_document(state, doc, Some(path));
                     }
-                    Err(e) => log::warn!("Couldn't reopen {path:?}: {e}"),
+                    let active = preferences.active_document.as_ref().and_then(|path| {
+                        state
+                            .tabs
+                            .iter()
+                            .position(|t| t.path.as_ref() == Some(path))
+                    });
+                    if let Some(index) = active {
+                        switch_to_tab(state, index);
+                    }
+                    // Reopening isn't a change: keep the recent files order.
+                    state.ui_state.recent_files = preferences.recent_files.clone();
                 }
             }
             state.saved_preferences = preferences;
@@ -2924,7 +3085,14 @@ impl ApplicationHandler<UserEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                // Ask first if anything is unsaved.
+                if (0..state.tabs.len()).any(|i| tab_is_dirty(state, i)) {
+                    state.ui_state.quit_prompt = true;
+                    state.needs_redraw = true;
+                    state.window.request_redraw();
+                } else {
+                    event_loop.exit();
+                }
             }
 
             WindowEvent::Resized(size) => {
@@ -2949,8 +3117,23 @@ impl ApplicationHandler<UserEvent> for App {
                 state.event_handler.update_laser_trail(1.0 / 60.0);
 
                 // Check for pending document from async file load
+                #[cfg(feature = "native")]
+                {
+                    if let Some((doc, path)) = file_ops::take_pending_open() {
+                        open_document(state, doc, path);
+                    }
+                    for (tab_id, path, revision) in file_ops::take_pending_saves() {
+                        if let Some(index) = state.tabs.iter().position(|t| t.id == tab_id) {
+                            mark_saved(state, index, path, revision);
+                            if std::mem::take(&mut state.tabs[index].close_after_save) {
+                                close_tab(state, index);
+                            }
+                        }
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
                 if let Some(doc) = file_ops::take_pending_document() {
-                    open_document(state, doc);
+                    open_document(state, doc, None);
                 }
 
                 // Check for a pending Excalidraw library loaded into a new tab.
@@ -3256,7 +3439,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // Run egui and get any actions
                 let egui_input = state.egui_state.take_egui_input(&state.window);
                 // Sync the tab strip metadata for the UI to render.
-                state.ui_state.tab_names = state.tabs.iter().map(|t| t.name.clone()).collect();
+                state.ui_state.tabs = (0..state.tabs.len())
+                    .map(|i| crate::ui::TabInfo {
+                        name: state.tabs[i].name.clone(),
+                        dirty: tab_is_dirty(state, i),
+                        path: state.tabs[i].path.clone(),
+                    })
+                    .collect();
                 state.ui_state.active_tab = state.active_tab;
                 let mut deferred_action: Option<UiAction> = None;
                 let mut tab_action: Option<UiAction> = None;
@@ -3367,10 +3556,15 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             UiAction::SaveLocal => {
                                 // Save with current document name
+                                #[cfg(target_arch = "wasm32")]
                                 file_ops::save_document(
                                     &state.canvas.document,
                                     &state.canvas.document.name,
                                 );
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    tab_action = Some(UiAction::Save);
+                                }
                             }
                             UiAction::SaveLocalAs => {
                                 // Open save dialog
@@ -3406,7 +3600,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                                 #[cfg(not(target_arch = "wasm32"))]
                                 {
-                                    file_ops::save_document(&state.canvas.document, &name);
+                                    tab_action = Some(UiAction::SaveAs);
                                 }
                                 // Add to recent documents if not already there
                                 if !state.ui_state.recent_documents.contains(&name) {
@@ -3428,10 +3622,15 @@ impl ApplicationHandler<UserEvent> for App {
                                 }
                             }
                             UiAction::SaveDocument => {
+                                #[cfg(target_arch = "wasm32")]
                                 file_ops::save_document(
                                     &state.canvas.document,
                                     &state.canvas.document.name,
                                 );
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    tab_action = Some(UiAction::Save);
+                                }
                             }
                             UiAction::LoadDocument => {
                                 #[cfg(not(target_arch = "wasm32"))]
@@ -3451,10 +3650,9 @@ impl ApplicationHandler<UserEvent> for App {
                                     &state.canvas.document.name,
                                 );
                                 #[cfg(not(target_arch = "wasm32"))]
-                                file_ops::save_document(
-                                    &state.canvas.document,
-                                    &state.canvas.document.name,
-                                );
+                                {
+                                    tab_action = Some(UiAction::Save);
+                                }
                             }
                             UiAction::UploadDocument => {
                                 // Upload from file (WASM: triggers file picker, Native: same as load)
@@ -3502,6 +3700,21 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             UiAction::SwitchTab(_)
                             | UiAction::CloseTab(_)
+                            | UiAction::CloseActiveTab
+                            | UiAction::ForceCloseTab(_)
+                            | UiAction::SaveAndCloseTab(_)
+                            | UiAction::CloseOtherTabs(_)
+                            | UiAction::Save
+                            | UiAction::SaveAs
+                            | UiAction::SaveTab(_)
+                            | UiAction::SaveTabAs(_)
+                            | UiAction::RenameTab(..)
+                            | UiAction::NextTab
+                            | UiAction::PreviousTab
+                            | UiAction::OpenFile
+                            | UiAction::OpenPath(_)
+                            | UiAction::QuitDiscard
+                            | UiAction::SaveAllAndQuit
                             | UiAction::ShowPractice(_)
                             | UiAction::NewDocument
                             | UiAction::LoadLibrary => {
@@ -4386,7 +4599,96 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(action) = tab_action {
                     match action {
                         UiAction::SwitchTab(i) => switch_to_tab(state, i),
-                        UiAction::CloseTab(i) => close_tab(state, i),
+                        UiAction::CloseTab(i) => request_close_tab(state, i),
+                        UiAction::CloseActiveTab => request_close_tab(state, state.active_tab),
+                        UiAction::ForceCloseTab(i) => close_tab(state, i),
+                        UiAction::CloseOtherTabs(keep) => {
+                            // Close the clean ones; ask about the first with
+                            // unsaved changes (the rest stay open).
+                            let mut keep = keep;
+                            for i in (0..state.tabs.len()).rev() {
+                                if i != keep && !tab_is_dirty(state, i) {
+                                    close_tab(state, i);
+                                    if i < keep {
+                                        keep -= 1;
+                                    }
+                                }
+                            }
+                            switch_to_tab(state, keep);
+                            state.ui_state.close_prompt = (0..state.tabs.len())
+                                .find(|&i| i != keep && tab_is_dirty(state, i));
+                        }
+                        UiAction::NextTab | UiAction::PreviousTab => {
+                            let n = state.tabs.len();
+                            let step = if matches!(action, UiAction::NextTab) {
+                                1
+                            } else {
+                                n - 1
+                            };
+                            switch_to_tab(state, (state.active_tab + step) % n);
+                        }
+                        UiAction::RenameTab(i, name) => {
+                            if let Some(tab) = state.tabs.get_mut(i) {
+                                tab.name = name.clone();
+                                tab.document.name = name.clone();
+                            }
+                            if i == state.active_tab {
+                                state.canvas.document.name = name;
+                            }
+                        }
+                        #[cfg(feature = "native")]
+                        UiAction::Save => {
+                            save_tab(state, state.active_tab, false);
+                        }
+                        #[cfg(feature = "native")]
+                        UiAction::SaveAs => {
+                            save_tab(state, state.active_tab, true);
+                        }
+                        #[cfg(feature = "native")]
+                        UiAction::SaveTab(i) => {
+                            save_tab(state, i, false);
+                        }
+                        #[cfg(feature = "native")]
+                        UiAction::SaveTabAs(i) => {
+                            save_tab(state, i, true);
+                        }
+                        #[cfg(feature = "native")]
+                        UiAction::SaveAndCloseTab(i) => {
+                            if save_tab(state, i, false) {
+                                close_tab(state, i);
+                            } else if let Some(tab) = state.tabs.get_mut(i) {
+                                // Closes once saved from the file dialog.
+                                tab.close_after_save = true;
+                            }
+                        }
+                        #[cfg(feature = "native")]
+                        UiAction::OpenFile => file_ops::load_document(),
+                        #[cfg(feature = "native")]
+                        UiAction::OpenPath(path) => match file_ops::read_document(&path) {
+                            Ok(doc) => open_document(state, doc, Some(path)),
+                            Err(e) => {
+                                log::error!("Couldn't open {path:?}: {e}");
+                                state.ui_state.recent_files.retain(|p| p != &path);
+                            }
+                        },
+                        #[cfg(feature = "native")]
+                        UiAction::SaveAllAndQuit => {
+                            let dirty: Vec<usize> = (0..state.tabs.len())
+                                .filter(|&i| tab_is_dirty(state, i))
+                                .collect();
+                            let saved_all = dirty.into_iter().all(|i| save_tab(state, i, false));
+                            if saved_all {
+                                state.quit_requested = true;
+                            }
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        UiAction::Save => {
+                            file_ops::save_document(
+                                &state.canvas.document,
+                                &state.canvas.document.name,
+                            );
+                        }
+                        UiAction::QuitDiscard => state.quit_requested = true,
                         UiAction::LoadLibrary => file_ops::load_excalidrawlib_async(),
                         UiAction::NewDocument => {
                             // "Untitled", or "Untitled 2", 3... if taken.
@@ -4439,6 +4741,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     state.needs_redraw = true;
                 }
+                if state.quit_requested {
+                    event_loop.exit();
+                    return;
+                }
 
                 // Handle deferred actions that need render_cx access
                 // Persist tablet settings edited in the settings window, and
@@ -4456,10 +4762,9 @@ impl ApplicationHandler<UserEvent> for App {
                     writing_guides: state.ui_state.writing_guides,
                     brush: state.canvas.tool_manager.brush,
                     nib_angle: state.canvas.tool_manager.nib_angle,
-                    #[cfg(feature = "native")]
-                    last_document: file_ops::last_path(),
-                    #[cfg(not(feature = "native"))]
-                    last_document: None,
+                    open_documents: state.tabs.iter().filter_map(|t| t.path.clone()).collect(),
+                    active_document: state.tabs[state.active_tab].path.clone(),
+                    recent_files: state.ui_state.recent_files.clone(),
                 };
                 if preferences != state.saved_preferences {
                     preferences.save();

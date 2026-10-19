@@ -273,8 +273,16 @@ pub struct UiState {
     pub writing_guides: WritingGuides,
     /// Tools and colours shown next to the pointer, when open.
     pub quick_bars: Option<QuickBars>,
-    /// Practice sheet submenu open in the main menu.
-    pub practice_submenu: Option<drafftink_core::practice::SheetKind>,
+    /// Submenu open in the main menu.
+    pub open_submenu: Option<MenuSubmenu>,
+    /// Recently saved or opened files, newest first.
+    pub recent_files: Vec<std::path::PathBuf>,
+    /// Tab being renamed and the name typed so far.
+    pub renaming_tab: Option<(usize, String)>,
+    /// Tab whose unsaved changes need a decision before closing.
+    pub close_prompt: Option<usize>,
+    /// Asked to quit with unsaved changes.
+    pub quit_prompt: bool,
     /// Current zoom level (1.0 = 100%).
     pub zoom_level: f64,
     /// Whether grid snapping is enabled.
@@ -361,10 +369,27 @@ pub struct UiState {
     pub last_picked_fill: Option<Color32>,
     /// Math editor state: (shape_id, latex_input)
     pub math_editor: Option<(ShapeId, String)>,
-    /// Names of the open tabs, in order (synced from the app each frame).
-    pub tab_names: Vec<String>,
-    /// Index of the active tab within `tab_names`.
+    /// The open tabs, in order (synced from the app each frame).
+    pub tabs: Vec<TabInfo>,
+    /// Index of the active tab within `tabs`.
     pub active_tab: usize,
+}
+
+/// What the tab strip shows about a tab.
+#[derive(Debug, Clone, Default)]
+pub struct TabInfo {
+    pub name: String,
+    /// Has changes since it was last saved.
+    pub dirty: bool,
+    /// The file it's saved in, if any.
+    pub path: Option<std::path::PathBuf>,
+}
+
+/// Submenus of the main menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuSubmenu {
+    Practice(SheetKind),
+    Recent,
 }
 
 impl Default for UiState {
@@ -380,7 +405,11 @@ impl Default for UiState {
             grid_style: GridStyle::default(),
             writing_guides: WritingGuides::default(),
             quick_bars: None,
-            practice_submenu: None,
+            open_submenu: None,
+            recent_files: Vec::new(),
+            renaming_tab: None,
+            close_prompt: None,
+            quit_prompt: false,
             zoom_level: drafftink_core::camera::BASE_ZOOM,
             grid_snap_enabled: false,
             smart_snap_enabled: false,
@@ -424,7 +453,7 @@ impl Default for UiState {
             last_picked_stroke: None,
             last_picked_fill: None,
             math_editor: None,
-            tab_names: Vec::new(),
+            tabs: Vec::new(),
             active_tab: 0,
         }
     }
@@ -500,8 +529,37 @@ pub enum UiAction {
     ImportMermaidFromClipboard,
     /// Switch to the tab at the given index.
     SwitchTab(usize),
-    /// Close the tab at the given index.
+    /// Close the tab at the given index (asking first if it has unsaved
+    /// changes).
     CloseTab(usize),
+    /// Close the active tab.
+    CloseActiveTab,
+    /// Close a tab, discarding unsaved changes.
+    ForceCloseTab(usize),
+    /// Save a tab, then close it.
+    SaveAndCloseTab(usize),
+    /// Close every tab but this one (asking about unsaved changes).
+    CloseOtherTabs(usize),
+    /// Save the active tab to its file (asking where the first time).
+    Save,
+    /// Save the active tab to a new file.
+    SaveAs,
+    /// Save a tab to its file (asking where the first time).
+    SaveTab(usize),
+    /// Save a tab to a new file.
+    SaveTabAs(usize),
+    /// Rename a tab.
+    RenameTab(usize, String),
+    NextTab,
+    PreviousTab,
+    /// Choose a document file to open.
+    OpenFile,
+    /// Open a document file.
+    OpenPath(std::path::PathBuf),
+    /// Quit, discarding unsaved changes.
+    QuitDiscard,
+    /// Save every tab with unsaved changes to its file, then quit.
+    SaveAllAndQuit,
     /// Load an Excalidraw library (`.excalidrawlib`) into a new tab.
     LoadLibrary,
     /// Export document as PNG file.
@@ -747,7 +805,9 @@ pub fn render_ui(
     let bottom_action = render_bottom_toolbar(ctx, ui_state);
     let right_panel_action = render_right_panel(ctx, selected_props);
     let math_action = render_math_editor(ctx, ui_state);
-    let tab_action = render_tab_bar(ctx, ui_state);
+    let tab_action = render_tab_bar(ctx, ui_state)
+        .or_else(|| render_close_prompt(ctx, ui_state))
+        .or_else(|| render_quit_prompt(ctx, ui_state));
 
     // Render presence panel (no actions returned)
     render_presence_panel(ctx, ui_state);
@@ -769,9 +829,8 @@ pub fn render_ui(
 /// separate thumbnail rendering is needed.
 fn render_tab_bar(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
     let mut action = None;
-    let tabs = ui_state.tab_names.clone();
+    let tabs = ui_state.tabs.clone();
     let active = ui_state.active_tab;
-    let closable = tabs.len() > 1;
 
     egui::Area::new(egui::Id::new("tab_bar"))
         .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -12.0))
@@ -780,9 +839,37 @@ fn render_tab_bar(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
             panel_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                    for (i, name) in tabs.iter().enumerate() {
+                    for (i, tab) in tabs.iter().enumerate() {
                         let selected = i == active;
-                        let label = egui::RichText::new(name).size(12.0).color(if selected {
+
+                        // Renaming: an inline text field in place of the tab.
+                        if let Some((index, name)) = &mut ui_state.renaming_tab {
+                            if *index == i {
+                                let edit = ui.add(
+                                    egui::TextEdit::singleline(name)
+                                        .desired_width(140.0)
+                                        .font(egui::FontId::proportional(12.0)),
+                                );
+                                edit.request_focus();
+                                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                                if enter && !name.trim().is_empty() {
+                                    action = Some(UiAction::RenameTab(i, name.trim().to_string()));
+                                    ui_state.renaming_tab = None;
+                                } else if escape || (edit.lost_focus() && !enter) {
+                                    ui_state.renaming_tab = None;
+                                }
+                                continue;
+                            }
+                        }
+
+                        // A dot marks unsaved changes.
+                        let text = if tab.dirty {
+                            format!("{} ●", tab.name)
+                        } else {
+                            tab.name.clone()
+                        };
+                        let label = egui::RichText::new(text).size(12.0).color(if selected {
                             Color32::WHITE
                         } else {
                             Color32::from_gray(90)
@@ -794,20 +881,53 @@ fn render_tab_bar(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                                 Color32::TRANSPARENT
                             })
                             .corner_radius(egui::CornerRadius::same(4));
-                        if ui.add(btn).clicked() {
+                        let mut tooltip = match &tab.path {
+                            Some(path) => path.display().to_string(),
+                            None => "Not saved yet".to_string(),
+                        };
+                        if tab.dirty {
+                            tooltip.push_str("\nUnsaved changes");
+                        }
+                        tooltip.push_str("\nDouble-click to rename; right-click for more");
+                        let response = ui.add(btn).on_hover_text(tooltip);
+                        if response.clicked() {
                             action = Some(UiAction::SwitchTab(i));
                         }
-                        if closable {
-                            let close = egui::Button::new(
-                                egui::RichText::new("×")
-                                    .size(13.0)
-                                    .color(Color32::from_gray(120)),
-                            )
-                            .fill(Color32::TRANSPARENT)
-                            .corner_radius(egui::CornerRadius::same(4));
-                            if ui.add(close).on_hover_text("Close tab").clicked() {
-                                action = Some(UiAction::CloseTab(i));
+                        if response.double_clicked() {
+                            ui_state.renaming_tab = Some((i, tab.name.clone()));
+                        }
+                        if response.middle_clicked() {
+                            action = Some(UiAction::CloseTab(i));
+                        }
+                        response.context_menu(|ui| {
+                            let mut item = |ui: &mut egui::Ui, text: &str, picked: UiAction| {
+                                if ui.button(text).clicked() {
+                                    action = Some(picked);
+                                    ui.close();
+                                }
+                            };
+                            item(ui, "Save", UiAction::SaveTab(i));
+                            item(ui, "Save As...", UiAction::SaveTabAs(i));
+                            if ui.button("Rename...").clicked() {
+                                ui_state.renaming_tab = Some((i, tab.name.clone()));
+                                ui.close();
                             }
+                            ui.separator();
+                            item(ui, "Close", UiAction::CloseTab(i));
+                            if tabs.len() > 1 {
+                                item(ui, "Close Others", UiAction::CloseOtherTabs(i));
+                            }
+                        });
+
+                        let close = egui::Button::new(
+                            egui::RichText::new("×")
+                                .size(13.0)
+                                .color(Color32::from_gray(120)),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .corner_radius(egui::CornerRadius::same(4));
+                        if ui.add(close).on_hover_text("Close tab").clicked() {
+                            action = Some(UiAction::CloseTab(i));
                         }
                     }
 
@@ -843,6 +963,88 @@ fn render_tab_bar(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
             });
         });
 
+    action
+}
+
+/// Ask what to do with a tab's unsaved changes before closing it.
+fn render_close_prompt(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
+    let index = ui_state.close_prompt?;
+    let Some(tab) = ui_state.tabs.get(index).cloned() else {
+        ui_state.close_prompt = None;
+        return None;
+    };
+    let mut action = None;
+    egui::Window::new("Unsaved changes")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label(format!("Save changes to \"{}\" before closing?", tab.name));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if primary_btn(ui, "Save") {
+                    action = Some(UiAction::SaveAndCloseTab(index));
+                }
+                if secondary_btn(ui, "Don't save") {
+                    action = Some(UiAction::ForceCloseTab(index));
+                }
+                if secondary_btn(ui, "Cancel") || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    ui_state.close_prompt = None;
+                }
+            });
+        });
+    if action.is_some() {
+        ui_state.close_prompt = None;
+    }
+    action
+}
+
+/// Ask what to do with unsaved changes before quitting.
+fn render_quit_prompt(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
+    if !ui_state.quit_prompt {
+        return None;
+    }
+    let dirty: Vec<&TabInfo> = ui_state.tabs.iter().filter(|t| t.dirty).collect();
+    let all_have_files = dirty.iter().all(|t| t.path.is_some());
+    let mut action = None;
+    let mut cancel = false;
+    egui::Window::new("Quit with unsaved changes?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label("These tabs have unsaved changes:");
+            for tab in &dirty {
+                let saved_in = match &tab.path {
+                    Some(path) => path.display().to_string(),
+                    None => "not saved yet".to_string(),
+                };
+                ui.label(format!("• {} ({saved_in})", tab.name));
+            }
+            if !all_have_files {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Save new documents with Save As before quitting.")
+                        .size(11.0)
+                        .color(Color32::from_gray(120)),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if all_have_files && primary_btn(ui, "Save all and quit") {
+                    action = Some(UiAction::SaveAllAndQuit);
+                }
+                if secondary_btn(ui, "Quit without saving") {
+                    action = Some(UiAction::QuitDiscard);
+                }
+                if secondary_btn(ui, "Cancel") || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+            });
+        });
+    if cancel || action.is_some() {
+        ui_state.quit_prompt = false;
+    }
     action
 }
 
@@ -1387,6 +1589,13 @@ pub fn command_action(command: Command) -> Option<QueuedAction> {
         Command::ZoomToFit => ui(UiAction::ZoomToFit),
         Command::CenterCanvas => ui(UiAction::CenterCanvas),
         Command::NewDocument => ui(UiAction::NewDocument),
+        Command::Save => ui(UiAction::Save),
+        Command::SaveAs => ui(UiAction::SaveAs),
+        Command::CloseTab => ui(UiAction::CloseActiveTab),
+        Command::NextTab => ui(UiAction::NextTab),
+        Command::PreviousTab => ui(UiAction::PreviousTab),
+        #[cfg(not(target_arch = "wasm32"))]
+        Command::Open => ui(UiAction::OpenFile),
         Command::ToggleGrid => ui(UiAction::ToggleGrid),
         Command::Grid(style) => ui(UiAction::SetGridStyle(style)),
         Command::ToggleGridSnap => ui(UiAction::ToggleGridSnap),
@@ -2458,8 +2667,9 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
             });
         });
 
-    // Practice submenu: the parent item and its rect, set while drawing the menu.
-    let mut practice_anchor: Option<(SheetKind, Rect)> = None;
+    // Open submenu: which one and its parent item's rect, set while drawing
+    // the menu.
+    let mut submenu_anchor: Option<(MenuSubmenu, Rect)> = None;
 
     // Dropdown menu (only shown when open)
     if ui_state.menu_open {
@@ -2480,25 +2690,69 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                             action = Some(UiAction::NewDocument);
                             ui_state.menu_open = false;
                         }
-                        if menu_item(ui, "Save Local", &ui_state.keybindings.hint(Command::Save)) {
-                            action = Some(UiAction::SaveLocal);
-                            ui_state.menu_open = false;
+                        let mut over_parent = false;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if menu_item(ui, "Open...", &ui_state.keybindings.hint(Command::Open)) {
+                                action = Some(UiAction::OpenFile);
+                                ui_state.menu_open = false;
+                            }
+                            let item = ui.scope(|ui| menu_item(ui, "Open Recent  ›", ""));
+                            let hovered = ui.rect_contains_pointer(item.response.rect);
+                            over_parent |= hovered;
+                            if item.inner || hovered {
+                                ui_state.open_submenu = Some(MenuSubmenu::Recent);
+                            }
+                            if ui_state.open_submenu == Some(MenuSubmenu::Recent) {
+                                submenu_anchor = Some((MenuSubmenu::Recent, item.response.rect));
+                            }
+                            if menu_item(ui, "Save", &ui_state.keybindings.hint(Command::Save)) {
+                                action = Some(UiAction::Save);
+                                ui_state.menu_open = false;
+                            }
+                            if menu_item(
+                                ui,
+                                "Save As...",
+                                &ui_state.keybindings.hint(Command::SaveAs),
+                            ) {
+                                action = Some(UiAction::SaveAs);
+                                ui_state.menu_open = false;
+                            }
+                            if menu_item(
+                                ui,
+                                "Close Tab",
+                                &ui_state.keybindings.hint(Command::CloseTab),
+                            ) {
+                                action = Some(UiAction::CloseActiveTab);
+                                ui_state.menu_open = false;
+                            }
                         }
-                        if menu_item(ui, "Save Local As...", "") {
-                            action = Some(UiAction::SaveLocalAs);
-                            ui_state.menu_open = false;
-                        }
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            if menu_item(
+                                ui,
+                                "Save Local",
+                                &ui_state.keybindings.hint(Command::Save),
+                            ) {
+                                action = Some(UiAction::SaveLocal);
+                                ui_state.menu_open = false;
+                            }
+                            if menu_item(ui, "Save Local As...", "") {
+                                action = Some(UiAction::SaveLocalAs);
+                                ui_state.menu_open = false;
+                            }
 
-                        widgets_menu_separator(ui);
+                            widgets_menu_separator(ui);
 
-                        if menu_item(ui, "Open", &ui_state.keybindings.hint(Command::Open)) {
-                            action = Some(UiAction::ShowOpenDialog);
-                            ui_state.menu_open = false;
-                        }
+                            if menu_item(ui, "Open", &ui_state.keybindings.hint(Command::Open)) {
+                                action = Some(UiAction::ShowOpenDialog);
+                                ui_state.menu_open = false;
+                            }
 
-                        if menu_item(ui, "Open Recent...", "") {
-                            action = Some(UiAction::ShowOpenRecentDialog);
-                            ui_state.menu_open = false;
+                            if menu_item(ui, "Open Recent...", "") {
+                                action = Some(UiAction::ShowOpenRecentDialog);
+                                ui_state.menu_open = false;
+                            }
                         }
 
                         widgets_menu_separator(ui);
@@ -2514,23 +2768,23 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                         }
 
                         // Practice sheet submenus open on hover (or click).
-                        let mut over_parent = false;
                         for kind in [SheetKind::Handwriting, SheetKind::Calligraphy] {
+                            let submenu = MenuSubmenu::Practice(kind);
                             let item =
                                 ui.scope(|ui| menu_item(ui, &format!("{}  ›", kind.name()), ""));
                             let hovered = ui.rect_contains_pointer(item.response.rect);
                             over_parent |= hovered;
                             if item.inner || hovered {
-                                ui_state.practice_submenu = Some(kind);
+                                ui_state.open_submenu = Some(submenu);
                             }
-                            if ui_state.practice_submenu == Some(kind) {
-                                practice_anchor = Some((kind, item.response.rect));
+                            if ui_state.open_submenu == Some(submenu) {
+                                submenu_anchor = Some((submenu, item.response.rect));
                             }
                         }
                         // Hovering another item closes the submenu.
                         if !over_parent && ui.ui_contains_pointer() {
-                            ui_state.practice_submenu = None;
-                            practice_anchor = None;
+                            ui_state.open_submenu = None;
+                            submenu_anchor = None;
                         }
 
                         widgets_menu_separator(ui);
@@ -2652,8 +2906,8 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
             }
         }
 
-        if let Some((kind, rect)) = practice_anchor {
-            egui::Area::new(egui::Id::new("practice_submenu"))
+        if let Some((submenu, rect)) = submenu_anchor {
+            egui::Area::new(egui::Id::new("menu_submenu"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(rect.right_top() + Vec2::new(10.0, -8.0))
                 .constrain(true)
@@ -2661,12 +2915,40 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                     panel_frame().show(ui, |ui| {
                         ui.set_width(220.0);
                         ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
-                        for sheet in PracticeSheet::all().filter(|s| s.kind() == kind) {
-                            if menu_item(ui, sheet.name(), "") {
-                                action = Some(UiAction::ShowPractice(sheet));
-                                ui_state.menu_open = false;
-                                ui_state.practice_submenu = None;
+                        let mut picked = None;
+                        match submenu {
+                            MenuSubmenu::Practice(kind) => {
+                                for sheet in PracticeSheet::all().filter(|s| s.kind() == kind) {
+                                    if menu_item(ui, sheet.name(), "") {
+                                        picked = Some(UiAction::ShowPractice(sheet));
+                                    }
+                                }
                             }
+                            MenuSubmenu::Recent => {
+                                if ui_state.recent_files.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("No recent files")
+                                            .size(12.0)
+                                            .color(Color32::from_gray(140)),
+                                    );
+                                }
+                                for path in &ui_state.recent_files {
+                                    let name = path
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    let item = ui.scope(|ui| menu_item(ui, &name, ""));
+                                    item.response.on_hover_text(path.display().to_string());
+                                    if item.inner {
+                                        picked = Some(UiAction::OpenPath(path.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        if picked.is_some() {
+                            action = picked;
+                            ui_state.menu_open = false;
+                            ui_state.open_submenu = None;
                         }
                     });
                 });

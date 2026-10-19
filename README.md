@@ -101,6 +101,15 @@ stroke colours above it; and the properties panel to its right. Press again (or
 Esc, or click the canvas) to hide them. Picking a tool hides them; colours,
 widths and properties stay open so you can set several.
 
+**Tabs and files.** Each tab is a document. Ctrl+N or Ctrl+T (or "+ New") opens
+an empty one, Ctrl+O opens a file in a new tab (or switches to it if it's already
+open), Ctrl+S saves to the tab's file (asking where only the first time),
+Ctrl+Shift+S saves elsewhere, Ctrl+W closes the tab, and Ctrl+Tab /
+Ctrl+Shift+Tab switch tabs. A dot (●) marks unsaved changes; you're asked
+before closing such a tab or quitting. Right-click a tab to save, rename or
+close it (double-click renames, middle-click closes). Menu → Open Recent lists
+recent files, and the tabs open when you quit come back on the next start.
+
 **Menu → Handwriting practice ›** and **Calligraphy practice ›** open practice
 sheets in their own tab: every uppercase and lowercase letter, number and symbol
 in a lettering style, on matching guide lines, each line followed by an empty

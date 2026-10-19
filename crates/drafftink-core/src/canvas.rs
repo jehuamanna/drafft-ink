@@ -40,6 +40,10 @@ pub struct CanvasDocument {
     /// Redo history stack.
     #[serde(skip)]
     redo_stack: Vec<DocumentSnapshot>,
+    /// Counts changes, to tell whether the document changed since it was
+    /// saved (see [`Self::revision`]).
+    #[serde(skip)]
+    revision: u64,
 }
 
 impl Default for CanvasDocument {
@@ -58,7 +62,20 @@ impl CanvasDocument {
             z_order: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            revision: 0,
         }
+    }
+
+    /// A number that changes whenever the document is edited. Compare it with
+    /// the value at the last save to know whether there are unsaved changes.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Record a change made without the methods below (which record their
+    /// own).
+    pub fn touch(&mut self) {
+        self.revision += 1;
     }
 
     /// Take a snapshot of the current document state for undo.
@@ -71,6 +88,7 @@ impl CanvasDocument {
 
     /// Push current state to undo stack (call before making changes).
     pub fn push_undo(&mut self) {
+        self.revision += 1;
         let snapshot = self.snapshot();
         self.undo_stack.push(snapshot);
 
@@ -94,6 +112,7 @@ impl CanvasDocument {
             // Restore the snapshot
             self.shapes = snapshot.shapes;
             self.z_order = snapshot.z_order;
+            self.revision += 1;
 
             true
         } else {
@@ -112,6 +131,7 @@ impl CanvasDocument {
             // Restore the snapshot
             self.shapes = snapshot.shapes;
             self.z_order = snapshot.z_order;
+            self.revision += 1;
 
             true
         } else {
@@ -131,6 +151,7 @@ impl CanvasDocument {
 
     /// Add a shape to the document.
     pub fn add_shape(&mut self, shape: Shape) {
+        self.revision += 1;
         let id = shape.id();
         self.z_order.push(id);
         self.shapes.insert(id, shape);
@@ -138,12 +159,14 @@ impl CanvasDocument {
 
     /// Remove a shape from the document.
     pub fn remove_shape(&mut self, id: ShapeId) -> Option<Shape> {
+        self.revision += 1;
         self.z_order.retain(|&shape_id| shape_id != id);
         self.shapes.remove(&id)
     }
 
     /// Clear all shapes from the document.
     pub fn clear(&mut self) {
+        self.revision += 1;
         self.shapes.clear();
         self.z_order.clear();
     }
@@ -155,6 +178,7 @@ impl CanvasDocument {
 
     /// Get a mutable reference to a shape by ID.
     pub fn get_shape_mut(&mut self, id: ShapeId) -> Option<&mut Shape> {
+        self.revision += 1;
         self.shapes.get_mut(&id)
     }
 
@@ -165,12 +189,14 @@ impl CanvasDocument {
 
     /// Bring a shape to the front (topmost).
     pub fn bring_to_front(&mut self, id: ShapeId) {
+        self.revision += 1;
         self.z_order.retain(|&shape_id| shape_id != id);
         self.z_order.push(id);
     }
 
     /// Send a shape to the back (bottommost).
     pub fn send_to_back(&mut self, id: ShapeId) {
+        self.revision += 1;
         self.z_order.retain(|&shape_id| shape_id != id);
         self.z_order.insert(0, id);
     }
@@ -178,6 +204,7 @@ impl CanvasDocument {
     /// Move a shape one layer forward (towards front).
     /// Returns true if the shape was moved, false if already at front.
     pub fn bring_forward(&mut self, id: ShapeId) -> bool {
+        self.revision += 1;
         if let Some(pos) = self.z_order.iter().position(|&shape_id| shape_id == id) {
             if pos < self.z_order.len() - 1 {
                 self.z_order.swap(pos, pos + 1);
@@ -190,6 +217,7 @@ impl CanvasDocument {
     /// Move a shape one layer backward (towards back).
     /// Returns true if the shape was moved, false if already at back.
     pub fn send_backward(&mut self, id: ShapeId) -> bool {
+        self.revision += 1;
         if let Some(pos) = self.z_order.iter().position(|&shape_id| shape_id == id) {
             if pos > 0 {
                 self.z_order.swap(pos, pos - 1);
@@ -312,6 +340,7 @@ impl CanvasDocument {
     /// Returns the new group's ID, or None if less than 2 shapes were provided.
     /// The group will be placed at the position of the frontmost shape in z-order.
     pub fn group_shapes(&mut self, shape_ids: &[ShapeId]) -> Option<ShapeId> {
+        self.revision += 1;
         if shape_ids.len() < 2 {
             return None;
         }
@@ -360,6 +389,7 @@ impl CanvasDocument {
     /// Ungroup a group shape, returning its children to the document.
     /// Returns the IDs of the ungrouped children, or None if the shape is not a group.
     pub fn ungroup_shape(&mut self, group_id: ShapeId) -> Option<Vec<ShapeId>> {
+        self.revision += 1;
         // Check if the shape is a group
         let group = match self.shapes.get(&group_id) {
             Some(Shape::Group(g)) => g.clone(),
@@ -686,6 +716,27 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_revision_tracks_changes() {
+        let mut doc = CanvasDocument::new();
+        let start = doc.revision();
+        let rect = crate::shapes::Rectangle::new(Point::new(0.0, 0.0), 10.0, 10.0);
+        doc.push_undo();
+        doc.add_shape(Shape::Rectangle(rect));
+        assert_ne!(doc.revision(), start);
+        let saved = doc.revision();
+        assert_eq!(doc.clone().revision(), saved);
+        assert!(doc.undo());
+        assert_ne!(doc.revision(), saved);
+        // Nothing to undo: no change.
+        let now = doc.revision();
+        assert!(!doc.undo());
+        assert_eq!(doc.revision(), now);
+        // Loading starts clean.
+        let loaded = CanvasDocument::from_json(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(loaded.revision(), 0);
+    }
     use crate::shapes::{Rectangle, SerializableColor, ShapeTrait};
 
     #[test]

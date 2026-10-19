@@ -160,6 +160,7 @@ impl CollaborationManager {
     /// Update a shape, syncing to CRDT if enabled.
     pub fn update_shape(&mut self, doc: &mut CanvasDocument, shape: Shape) {
         let id = shape.id();
+        doc.touch();
         if let Some(existing) = doc.shapes.get_mut(&id) {
             *existing = shape.clone();
 
