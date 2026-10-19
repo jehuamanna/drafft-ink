@@ -473,6 +473,11 @@ impl App {
                     }
                 }
             }
+            ButtonAction::HoldQuickToolbars => {
+                if let Some(state) = &mut self.state {
+                    super::commands::show_quick_toolbars(state, pressed);
+                }
+            }
             _ if !pressed => {}
             ButtonAction::SwitchTool(tool) => {
                 if !self.pen.down {

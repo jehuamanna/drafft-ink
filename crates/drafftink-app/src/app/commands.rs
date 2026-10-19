@@ -29,11 +29,17 @@ fn same_view(a: (Vec2, f64), b: (Vec2, f64)) -> bool {
 
 /// Open the quick toolbars at the pointer, or close them if open.
 fn toggle_quick_toolbars(state: &mut AppState) {
+    let open = state.ui_state.quick_bars.is_none();
+    show_quick_toolbars(state, open);
+}
+
+/// Open the quick toolbars at the pointer (if not already open), or close them.
+pub(super) fn show_quick_toolbars(state: &mut AppState, open: bool) {
+    if open == state.ui_state.quick_bars.is_some() {
+        return;
+    }
     let now = state.egui_ctx.input(|i| i.time);
-    state.ui_state.quick_bars = match state.ui_state.quick_bars {
-        Some(_) => None,
-        None => Some(crate::ui::QuickBars::new(now)),
-    };
+    state.ui_state.quick_bars = open.then(|| crate::ui::QuickBars::new(now));
     state.needs_redraw = true;
     state.window.request_redraw();
 }

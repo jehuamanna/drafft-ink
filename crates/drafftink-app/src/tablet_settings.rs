@@ -37,6 +37,8 @@ pub enum ButtonAction {
     RightClick,
     /// Use a tool while held, then return to the previous one.
     HoldTool(ToolKind),
+    /// Show the tools and colours at the pointer while held.
+    HoldQuickToolbars,
     /// Switch to a tool.
     SwitchTool(ToolKind),
     /// Switch to a tool, or back to the previous one if already active.
@@ -51,6 +53,7 @@ impl ButtonAction {
         let tools = all_tools();
         let mut groups = vec![
             ("Mouse", vec![Self::None, Self::Pan, Self::RightClick]),
+            ("While held", vec![Self::HoldQuickToolbars]),
             (
                 "Tool while held",
                 tools.iter().map(|&t| Self::HoldTool(t)).collect(),
@@ -83,6 +86,7 @@ impl ButtonAction {
             Self::Pan => "Pan (hold)".into(),
             Self::RightClick => "Right click".into(),
             Self::HoldTool(tool) => format!("{} (hold)", tool_label(tool)),
+            Self::HoldQuickToolbars => format!("{} (hold)", Command::QuickToolbars.label()),
             Self::SwitchTool(tool) => format!("{} (switch)", tool_label(tool)),
             Self::ToggleTool(tool) => format!("{} (toggle)", tool_label(tool)),
             Self::Command(command) => command.label(),
