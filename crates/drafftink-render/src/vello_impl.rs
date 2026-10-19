@@ -11,6 +11,12 @@ use peniko::{Brush, Color, Fill};
 use roughr::core::{FillStyle, OptionsBuilder};
 use vello::Scene;
 
+// This fork's rendering lives in these modules, to keep upstream merges simple.
+mod brushes;
+mod overlays;
+
+use brushes::*;
+
 /// Result of PNG rendering - contains the raw RGBA pixel data and dimensions.
 #[derive(Debug)]
 pub struct PngRenderResult {
@@ -54,10 +60,6 @@ struct CachedTextLayout {
     height: f64,
 }
 
-/// Pen stroke outlines by shape: (content hash, frame last used, filled layers).
-type FreehandCache =
-    std::collections::HashMap<drafftink_core::shapes::ShapeId, (u64, u64, Vec<(BezPath, Color)>)>;
-
 /// Vello-based renderer for GPU-accelerated 2D graphics.
 pub struct VelloRenderer {
     /// The Vello scene being built.
@@ -78,13 +80,8 @@ pub struct VelloRenderer {
     shape_cache: std::collections::HashMap<(String, u32, u32, u64, i32, u64), BezPath>,
     /// Text layout cache. Key: (shape_id, content_hash)
     text_cache: std::collections::HashMap<(String, u64), CachedTextLayout>,
-    /// Pen stroke outlines by shape: (content hash, frame last used, filled
-    /// layers). Building outlines is the costly part of drawing strokes.
-    freehand_cache: FreehandCache,
-    /// Frames built, for evicting unused cache entries.
-    frame: u64,
-    /// Off while drawing the in-progress stroke, which is new every frame.
-    cache_freehand: bool,
+    /// Cached pen stroke outlines.
+    strokes: StrokeCache,
 }
 
 impl Default for VelloRenderer {
@@ -370,9 +367,7 @@ impl VelloRenderer {
             image_cache: std::collections::HashMap::new(),
             shape_cache: std::collections::HashMap::new(),
             text_cache: std::collections::HashMap::new(),
-            freehand_cache: std::collections::HashMap::new(),
-            frame: 0,
-            cache_freehand: true,
+            strokes: StrokeCache::default(),
         }
     }
 
@@ -728,9 +723,8 @@ impl VelloRenderer {
         freehand: &drafftink_core::shapes::Freehand,
         transform: Affine,
     ) {
-        let layers = if self.cache_freehand {
-            cached_freehand_layers(&mut self.freehand_cache, freehand, self.zoom, self.frame)
-                .to_vec()
+        let layers = if self.strokes.enabled {
+            self.strokes.layers(freehand, self.zoom).to_vec()
         } else {
             freehand_layers(freehand, detail_for_zoom(self.zoom))
         };
@@ -1578,14 +1572,7 @@ impl Renderer for VelloRenderer {
         // Clear the scene
         self.scene.reset();
         self.selection_color = ctx.selection_color;
-        self.frame += 1;
-        // Forget outlines of strokes not drawn for a while (deleted, edited,
-        // or long off-screen), checking only now and then.
-        if self.frame % 120 == 0 {
-            let frame = self.frame;
-            self.freehand_cache
-                .retain(|_, (_, used, _)| frame - *used < 600);
-        }
+        self.strokes.next_frame();
         self.zoom = ctx.canvas.camera.zoom;
 
         let camera_transform = ctx.canvas.camera.transform();
@@ -1618,7 +1605,7 @@ impl Renderer for VelloRenderer {
         );
 
         // Draw all shapes in z-order (skip shape being edited or off-screen)
-        let mut batch: Option<(Color, BezPath)> = None;
+        let mut batch = StrokeBatch::default();
         for shape in ctx.canvas.document.shapes_ordered() {
             if ctx.editing_shape_id == Some(shape.id()) {
                 continue;
@@ -1627,59 +1614,20 @@ impl Renderer for VelloRenderer {
             let shape_bounds = shape.bounds().inflate(1.0, 1.0);
             if !shape_bounds.intersect(world_viewport).is_zero_area() {
                 let is_selected = ctx.canvas.is_selected(shape.id());
-                // Runs of same-coloured pen strokes become one fill: far fewer
-                // paths for the GPU when many strokes are on screen. They all
-                // wind the same way, so the non-zero fill draws them as before.
-                if let Shape::Freehand(freehand) = shape {
-                    let layered = !freehand.closed
-                        && (freehand.has_pressure()
-                            || freehand.brush != drafftink_core::shapes::Brush::Pen);
-                    if layered && !is_selected && shape.rotation().abs() <= 0.001 {
-                        let layers = cached_freehand_layers(
-                            &mut self.freehand_cache,
-                            freehand,
-                            self.zoom,
-                            self.frame,
-                        );
-                        for (path, color) in layers {
-                            match &mut batch {
-                                Some((batch_color, batch_path)) if batch_color == color => {
-                                    batch_path.extend(path.iter());
-                                }
-                                _ => {
-                                    if let Some((color, path)) = batch.take() {
-                                        self.scene.fill(
-                                            Fill::NonZero,
-                                            camera_transform,
-                                            color,
-                                            None,
-                                            &path,
-                                        );
-                                    }
-                                    batch = Some((*color, path.clone()));
-                                }
-                            }
-                        }
-                        continue;
-                    }
+                if self.batch_stroke(&mut batch, shape, is_selected, camera_transform) {
+                    continue;
                 }
-                if let Some((color, path)) = batch.take() {
-                    self.scene
-                        .fill(Fill::NonZero, camera_transform, color, None, &path);
-                }
+                batch.fill(&mut self.scene, camera_transform);
                 self.render_shape(shape, camera_transform, is_selected);
             }
         }
-        if let Some((color, path)) = batch.take() {
-            self.scene
-                .fill(Fill::NonZero, camera_transform, color, None, &path);
-        }
+        batch.fill(&mut self.scene, camera_transform);
 
         // Draw preview shape if tool is active
         if let Some(preview) = ctx.canvas.tool_manager.preview_shape() {
-            self.cache_freehand = false;
+            self.strokes.enabled = false;
             self.render_shape(&preview, camera_transform, false);
-            self.cache_freehand = true;
+            self.strokes.enabled = true;
         }
 
         // Draw selection rectangle (marquee)
@@ -2184,27 +2132,6 @@ impl VelloRenderer {
         );
     }
 
-    /// Render the brush outline: a thin dark ring with a light halo so it
-    /// stays visible on any background.
-    fn render_brush_cursor(&mut self, pos: Point, diameter: f64, opacity: f64, transform: Affine) {
-        let circle = kurbo::Circle::new(pos, (diameter / 2.0).max(1.0 / self.zoom));
-        let alpha = |a: f64| (a * opacity.clamp(0.0, 1.0) * 255.0) as u8;
-        self.scene.stroke(
-            &Stroke::new(3.0 / self.zoom),
-            transform,
-            Color::from_rgba8(255, 255, 255, alpha(0.7)),
-            None,
-            &circle,
-        );
-        self.scene.stroke(
-            &Stroke::new(1.0 / self.zoom),
-            transform,
-            Color::from_rgba8(40, 40, 40, alpha(0.8)),
-            None,
-            &circle,
-        );
-    }
-
     /// Render laser pointer with trail.
     fn render_laser_pointer(&mut self, pos: Point, trail: &[(Point, f64)], transform: Affine) {
         // Draw trail with fading effect
@@ -2304,104 +2231,6 @@ impl VelloRenderer {
                 .stroke(&stroke, transform, grid_color, None, &path);
             y += grid_size;
         }
-    }
-
-    /// Render handwriting (3-line) or calligraphy (4-line) practice guides:
-    /// rows of ascender, waist (x-height), base and descender lines, with
-    /// optional slant lines.
-    fn render_writing_guides(
-        &mut self,
-        viewport: Rect,
-        transform: Affine,
-        guides: &crate::renderer::WritingGuides,
-        four_lines: bool,
-    ) {
-        let inv = transform.inverse();
-        let top_left = inv * Point::new(viewport.x0, viewport.y0);
-        let bottom_right = inv * Point::new(viewport.x1, viewport.y1);
-        let x_height = guides.x_height.max(1.0);
-        let ascender = guides.ascender.max(0.0) * x_height;
-        let descender = guides.descender.max(0.0) * x_height;
-        let row = guides.row_height();
-        // Too dense to be useful (or to draw quickly) when zoomed far out.
-        if row * self.zoom < 6.0 {
-            return;
-        }
-
-        // Lines stay hairline-thin on screen at any zoom.
-        let px = 1.0 / self.zoom;
-        let base_color = Color::from_rgba8(70, 110, 200, 170);
-        let waist_color = Color::from_rgba8(70, 110, 200, 120);
-        let outer_color = Color::from_rgba8(220, 90, 90, 110);
-        let band_color = Color::from_rgba8(70, 110, 200, 14);
-        let slant_color = Color::from_rgba8(150, 150, 150, 70);
-
-        let (x0, x1) = (top_left.x, bottom_right.x);
-        let first = ((top_left.y - descender) / row).floor() as i64;
-        let last = ((bottom_right.y + x_height + ascender) / row).ceil() as i64;
-
-        let mut bases = BezPath::new();
-        let mut waists = BezPath::new();
-        let mut outers = BezPath::new();
-        let mut slants = BezPath::new();
-        // Slant lines are one x-height apart; hide them once they'd be a
-        // blur of lines only a few pixels apart.
-        let slant = if x_height * self.zoom >= 8.0 {
-            guides.slant.clamp(-60.0, 60.0).to_radians().tan()
-        } else {
-            0.0
-        };
-        for k in first..=last {
-            let base = k as f64 * row;
-            let waist = base - x_height;
-            let top = waist - ascender;
-            let bottom = base + descender;
-
-            let band = Rect::new(x0, waist, x1, base);
-            self.scene
-                .fill(Fill::NonZero, transform, band_color, None, &band);
-
-            bases.move_to(Point::new(x0, base));
-            bases.line_to(Point::new(x1, base));
-            waists.move_to(Point::new(x0, waist));
-            waists.line_to(Point::new(x1, waist));
-            if ascender > 0.0 {
-                outers.move_to(Point::new(x0, top));
-                outers.line_to(Point::new(x1, top));
-            }
-            if four_lines && descender > 0.0 {
-                outers.move_to(Point::new(x0, bottom));
-                outers.line_to(Point::new(x1, bottom));
-            }
-
-            // Slant lines across the whole row, spaced one x-height apart
-            // and anchored to the canvas so they don't drift when panning.
-            if slant != 0.0 {
-                let lean = (bottom - top) * slant;
-                let spacing = x_height;
-                let mut x = ((x0 - lean.max(0.0)) / spacing).floor() * spacing;
-                while x <= x1 - lean.min(0.0) {
-                    slants.move_to(Point::new(x, bottom));
-                    slants.line_to(Point::new(x + lean, top));
-                    x += spacing;
-                }
-            }
-        }
-
-        self.scene
-            .stroke(&Stroke::new(1.3 * px), transform, base_color, None, &bases);
-        // Handwriting paper has a dashed midline; calligraphy a solid one.
-        let waist_stroke = if four_lines {
-            Stroke::new(px)
-        } else {
-            Stroke::new(px).with_dashes(0.0, [6.0 * px, 4.0 * px])
-        };
-        self.scene
-            .stroke(&waist_stroke, transform, waist_color, None, &waists);
-        self.scene
-            .stroke(&Stroke::new(px), transform, outer_color, None, &outers);
-        self.scene
-            .stroke(&Stroke::new(px), transform, slant_color, None, &slants);
     }
 
     /// Render grid as small crosses (+) at intersections.
@@ -2663,77 +2492,6 @@ mod tests {
     use drafftink_core::shapes::Rectangle;
 
     #[test]
-    fn test_convex_hull_winds_consistently() {
-        let points = vec![
-            Point::new(0.0, 0.0),
-            Point::new(2.0, 0.0),
-            Point::new(1.0, 1.0),
-            Point::new(2.0, 2.0),
-            Point::new(0.0, 2.0),
-        ];
-        let hull = convex_hull(points);
-        assert_eq!(hull.len(), 4);
-        assert!(!hull.contains(&Point::new(1.0, 1.0)));
-        let area: f64 = (0..hull.len())
-            .map(|i| {
-                hull[i]
-                    .to_vec2()
-                    .cross(hull[(i + 1) % hull.len()].to_vec2())
-            })
-            .sum();
-        assert!(area > 0.0);
-    }
-
-    #[test]
-    fn test_pointed_nib_shades_downstrokes_only() {
-        use drafftink_core::shapes::Brush;
-        let up = brush_width(
-            Brush::PointedNib,
-            2.0,
-            1.0,
-            kurbo::Vec2::new(0.0, -1.0),
-            50.0,
-        );
-        let down = brush_width(
-            Brush::PointedNib,
-            2.0,
-            1.0,
-            kurbo::Vec2::new(0.0, 1.0),
-            50.0,
-        );
-        let light = brush_width(
-            Brush::PointedNib,
-            2.0,
-            0.1,
-            kurbo::Vec2::new(0.0, 1.0),
-            50.0,
-        );
-        assert!(down > up * 5.0);
-        assert!(light < down / 4.0);
-    }
-
-    #[test]
-    fn test_brush_pen_tapers_at_ends() {
-        use drafftink_core::shapes::Brush;
-        let dir = kurbo::Vec2::new(1.0, 0.0);
-        let tip = brush_width(Brush::BrushPen, 2.0, 1.0, dir, 0.0);
-        let middle = brush_width(Brush::BrushPen, 2.0, 1.0, dir, 100.0);
-        assert!(tip < middle * 0.1);
-    }
-
-    #[test]
-    fn test_broad_nib_thick_across_thin_along() {
-        // Nib at 0°: horizontal moves run along the edge (thin), vertical
-        // moves across it (thick).
-        let p = [1.0, 1.0];
-        let along = broad_nib_outline(&[Point::new(0.0, 0.0), Point::new(10.0, 0.0)], &p, 2.0, 0.0);
-        let across =
-            broad_nib_outline(&[Point::new(0.0, 0.0), Point::new(0.0, 10.0)], &p, 2.0, 0.0);
-        assert!(along.bounding_box().height() < 1.0);
-        assert!(across.bounding_box().width() > 5.0);
-    }
-
-    #[test]
     fn test_renderer_creation() {
         let renderer = VelloRenderer::new();
         assert!(renderer.scene().encoding().is_empty());
@@ -2760,437 +2518,4 @@ mod tests {
         let ctx = RenderContext::new(&canvas, kurbo::Size::new(800.0, 600.0));
         renderer.build_scene(&ctx);
     }
-}
-
-/// Stroke detail (screen pixels per canvas unit, at most 1) for a zoom
-/// level. Zoomed out, strokes need fewer points to look the same; it changes
-/// in steps of two so cached outlines aren't rebuilt on every zoom change.
-fn detail_for_zoom(zoom: f64) -> f64 {
-    2f64.powf(zoom.log2().round()).min(1.0)
-}
-
-/// Outlines of a freehand stroke from the cache, rebuilt when the stroke (or
-/// the zoom detail) changed since they were made.
-fn cached_freehand_layers<'a>(
-    cache: &'a mut FreehandCache,
-    freehand: &drafftink_core::shapes::Freehand,
-    zoom: f64,
-    frame: u64,
-) -> &'a [(BezPath, Color)] {
-    use std::hash::{Hash, Hasher};
-
-    let detail = detail_for_zoom(zoom);
-    // Hashing a sample of the points keeps this cheap for long strokes;
-    // moving, scaling or erasing changes the endpoints or the count anyway.
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let n = freehand.points.len();
-    n.hash(&mut hasher);
-    let stride = (n / 16).max(1);
-    for i in (0..n).step_by(stride).chain(n.checked_sub(1)) {
-        freehand.points[i].x.to_bits().hash(&mut hasher);
-        freehand.points[i].y.to_bits().hash(&mut hasher);
-        freehand.pressure_at(i).to_bits().hash(&mut hasher);
-    }
-    freehand.pressures.len().hash(&mut hasher);
-    freehand.style.stroke_width.to_bits().hash(&mut hasher);
-    freehand.style.opacity.to_bits().hash(&mut hasher);
-    let c = freehand.style.stroke_color;
-    (c.r, c.g, c.b, c.a).hash(&mut hasher);
-    freehand.brush.hash(&mut hasher);
-    freehand.nib_angle.to_bits().hash(&mut hasher);
-    detail.to_bits().hash(&mut hasher);
-    let key = hasher.finish();
-
-    let entry = cache
-        .entry(freehand.id())
-        .or_insert_with(|| (key.wrapping_add(1), frame, Vec::new()));
-    if entry.0 != key {
-        *entry = (key, frame, freehand_layers(freehand, detail));
-    }
-    entry.1 = frame;
-    &entry.2
-}
-
-/// Filled outlines (with their colours) that draw a freehand stroke with its
-/// brush: variable width from pressure, direction and position along it.
-///
-/// `detail` is screen pixels per canvas unit (at most 1): sample spacing
-/// grows as it shrinks, so zoomed-out strokes stay cheap to draw.
-fn freehand_layers(
-    freehand: &drafftink_core::shapes::Freehand,
-    detail: f64,
-) -> Vec<(BezPath, Color)> {
-    use drafftink_core::shapes::Brush as PenBrush;
-
-    let n = freehand.points.len();
-    if n < 2 {
-        return Vec::new();
-    }
-
-    let style = &freehand.style;
-    let sw = style.stroke_width;
-    let color = style.stroke_with_opacity();
-    let pressures: Vec<f64> = (0..n).map(|i| freehand.pressure_at(i)).collect();
-
-    if freehand.brush == PenBrush::BroadNib {
-        // Interpolate a spline through the input so fast strokes don't
-        // show facets, then sweep the nib along it.
-        let (points, pressures) = catmull_rom_resample(&freehand.points, &pressures, 1.0 / detail);
-        let path = broad_nib_outline(&points, &pressures, sw, freehand.nib_angle);
-        return vec![(path, color)];
-    }
-
-    // A single outline pinches or notches at sharp turns (v, n, w), so
-    // each section between them becomes its own round-capped piece.
-    let reach = (sw * 2.3).max(4.0);
-    let mut sections = Vec::new();
-    let mut start = 0;
-    for end in sharp_corners(&freehand.points, reach)
-        .into_iter()
-        .chain([n - 1])
-    {
-        // Input points can be far apart on fast strokes; interpolate a
-        // spline through them so curves don't render as facets.
-        sections.push(catmull_rom_resample(
-            &freehand.points[start..=end],
-            &pressures[start..=end],
-            1.5 / detail,
-        ));
-        start = end;
-    }
-    let total_length: f64 = sections
-        .iter()
-        .map(|(points, _)| polyline_length(points))
-        .sum();
-
-    // Width of each sample, from the brush.
-    let widths: Vec<Vec<f64>> = {
-        let mut travelled = 0.0;
-        sections
-            .iter()
-            .map(|(points, pressures)| {
-                let directions = smoothed_directions(points, 3);
-                (0..points.len())
-                    .map(|i| {
-                        if i > 0 {
-                            travelled += points[i].distance(points[i - 1]);
-                        }
-                        let ends = travelled.min(total_length - travelled);
-                        brush_width(freehand.brush, sw, pressures[i], directions[i], ends)
-                    })
-                    .collect()
-            })
-            .collect()
-    };
-
-    // Translucent layers (scale of the width, share of the opacity).
-    // All pieces of one layer wind the same way, so the non-zero fill
-    // unions them without double-blending.
-    let layers: &[(f64, f32)] = match freehand.brush {
-        PenBrush::Soft => &[(1.0, 0.22), (0.8, 0.22), (0.6, 0.22), (0.4, 0.22)],
-        PenBrush::Pencil => &[(1.0, 0.5), (0.7, 0.45)],
-        _ => &[(1.0, 1.0)],
-    };
-    let mut filled = Vec::with_capacity(layers.len());
-    for (layer, &(scale, alpha)) in layers.iter().enumerate() {
-        let mut path = BezPath::new();
-        for ((points, _), widths) in sections.iter().zip(&widths) {
-            let widths: Vec<f64> = widths.iter().map(|w| w * scale).collect();
-            if freehand.brush == PenBrush::Pencil {
-                // Graphite: each layer wanders slightly off the line.
-                let points = jitter(points, &widths, layer as f64);
-                append_stroke_outline(&mut path, &points, &widths);
-            } else {
-                append_stroke_outline(&mut path, points, &widths);
-            }
-        }
-        filled.push((path, color.multiply_alpha(alpha)));
-    }
-    filled
-}
-
-/// Indices of sharp turns (over 90°) in a stroke. Directions are measured
-/// `reach` along the stroke on each side so sensor jitter doesn't count, and
-/// only the sharpest point of each turn is returned.
-fn sharp_corners(points: &[Point], reach: f64) -> Vec<usize> {
-    let mut corners = Vec::new();
-    // Sharpest point of the turn in progress: (index, cosine of turn angle).
-    let mut sharpest: Option<(usize, f64)> = None;
-    for i in 1..points.len().saturating_sub(1) {
-        let p = points[i];
-        let back = points[..i].iter().rev().find(|q| q.distance(p) >= reach);
-        let ahead = points[i + 1..].iter().find(|q| q.distance(p) >= reach);
-        let cos = match (back, ahead) {
-            (Some(&b), Some(&a)) => {
-                let (incoming, outgoing) = (p - b, a - p);
-                incoming.dot(outgoing) / (incoming.hypot() * outgoing.hypot())
-            }
-            _ => 1.0,
-        };
-        if cos < 0.0 {
-            if sharpest.is_none_or(|(_, c)| cos < c) {
-                sharpest = Some((i, cos));
-            }
-        } else if let Some((corner, _)) = sharpest.take() {
-            corners.push(corner);
-        }
-    }
-    corners.extend(sharpest.map(|(corner, _)| corner));
-    corners
-}
-
-/// Append the filled outline of a variable-width stroke through `points`
-/// (`widths` are full widths): left side forward, round end cap, right side
-/// backward, round start cap.
-fn append_stroke_outline(path: &mut BezPath, points: &[Point], widths: &[f64]) {
-    use kurbo::Vec2;
-
-    let mut left_points: Vec<Point> = Vec::new();
-    let mut right_points: Vec<Point> = Vec::new();
-    // Centre point and half width of the first and last outline samples,
-    // used to draw round caps.
-    let mut first_cap: Option<(Point, f64)> = None;
-    let mut last_cap: Option<(Point, f64)> = None;
-
-    for i in 0..points.len() {
-        let point = points[i];
-        let half_width = widths[i] / 2.0;
-
-        // Direction of travel: to the next point at the start, from the
-        // previous one at the end, and across both in between.
-        let prev = points[i.saturating_sub(1)];
-        let next = points[(i + 1).min(points.len() - 1)];
-        let dir = next - prev;
-        let len = dir.hypot();
-        if len < f64::EPSILON {
-            continue;
-        }
-
-        // Perpendicular unit vector
-        let perp = Vec2::new(-dir.y / len, dir.x / len);
-        left_points.push(point + perp * half_width);
-        right_points.push(point - perp * half_width);
-        first_cap.get_or_insert((point, half_width));
-        last_cap = Some((point, half_width));
-    }
-
-    let (Some(first_cap), Some(last_cap)) = (first_cap, last_cap) else {
-        return;
-    };
-
-    // Sides are smoothed with quadratic curves through segment midpoints so
-    // remaining unevenness doesn't show as corners.
-    path.move_to(left_points[0]);
-    append_smoothed(path, &left_points);
-    append_round_cap(path, last_cap, left_points[left_points.len() - 1]);
-    right_points.reverse();
-    append_smoothed(path, &right_points);
-    append_round_cap(path, first_cap, right_points[right_points.len() - 1]);
-    path.close_path();
-}
-
-/// Full width of a brush stroke at one sample. `direction` is the unit
-/// direction of travel and `ends` the distance to the nearer end of the stroke.
-fn brush_width(
-    brush: drafftink_core::shapes::Brush,
-    stroke_width: f64,
-    pressure: f64,
-    direction: kurbo::Vec2,
-    ends: f64,
-) -> f64 {
-    use drafftink_core::shapes::{Brush, pressure_width};
-
-    let p = pressure.clamp(0.0, 1.0);
-    match brush {
-        Brush::Pen | Brush::BroadNib => pressure_width(stroke_width, p),
-        Brush::Marker => stroke_width * 2.3,
-        Brush::PointedNib => {
-            // The tines only spread when pulled towards the writer, so
-            // upstrokes stay hairlines however hard you press.
-            let hairline = (stroke_width * 0.3).max(0.6);
-            let full = stroke_width * 4.0;
-            let down = direction.y.max(0.0);
-            hairline + (full - hairline) * p.powf(1.3) * down.powf(1.5)
-        }
-        Brush::BrushPen => {
-            let full = stroke_width * 3.2 * (0.05 + 0.95 * p.powf(1.4));
-            // Pointed entry and exit.
-            let taper_length = (stroke_width * 6.0).max(8.0);
-            let t = (ends / taper_length).clamp(0.0, 1.0);
-            full * (0.08 + 0.92 * t * t * (3.0 - 2.0 * t))
-        }
-        Brush::Pencil => stroke_width * 1.2 * (0.55 + 0.45 * p),
-        Brush::Soft => pressure_width(stroke_width * 1.8, p),
-    }
-}
-
-/// Outline of a broad (chisel) nib swept along `points`: thick when moving
-/// across the nib, thin along it, with crisp angled ends.
-fn broad_nib_outline(
-    points: &[Point],
-    pressures: &[f64],
-    stroke_width: f64,
-    angle: f64,
-) -> BezPath {
-    use kurbo::Vec2;
-
-    // Nib edge direction in y-down coordinates (angle counter-clockwise
-    // from horizontal, as on paper).
-    let angle = angle.to_radians();
-    let edge = Vec2::new(angle.cos(), -angle.sin());
-    let across = Vec2::new(-edge.y, edge.x);
-    let nib = |i: usize| {
-        let width = stroke_width * 4.0 * (0.75 + 0.25 * pressures[i].clamp(0.0, 1.0));
-        let thickness = (width * 0.08).max(0.5);
-        (edge * (width / 2.0), across * (thickness / 2.0))
-    };
-
-    let mut path = BezPath::new();
-    for i in 0..points.len().saturating_sub(1) {
-        let mut corners = Vec::with_capacity(8);
-        for j in [i, i + 1] {
-            let (half_edge, half_across) = nib(j);
-            for (e, a) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
-                corners.push(points[j] + half_edge * e + half_across * a);
-            }
-        }
-        // Every hull winds the same way, so the non-zero fill unions them.
-        let hull = convex_hull(corners);
-        if let Some((&first, rest)) = hull.split_first() {
-            path.move_to(first);
-            for &p in rest {
-                path.line_to(p);
-            }
-            path.close_path();
-        }
-    }
-    path
-}
-
-/// Convex hull (Andrew's monotone chain), counter-clockwise in y-up terms.
-fn convex_hull(mut points: Vec<Point>) -> Vec<Point> {
-    points.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
-    let cross = |o: Point, a: Point, b: Point| (a - o).cross(b - o);
-    let mut hull: Vec<Point> = Vec::with_capacity(points.len() + 1);
-    for pass in 0..2 {
-        let start = hull.len();
-        let iter: Box<dyn Iterator<Item = &Point>> = if pass == 0 {
-            Box::new(points.iter())
-        } else {
-            Box::new(points.iter().rev())
-        };
-        for &p in iter {
-            while hull.len() >= start + 2
-                && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0
-            {
-                hull.pop();
-            }
-            hull.push(p);
-        }
-        hull.pop();
-    }
-    hull
-}
-
-/// Total length of a polyline.
-fn polyline_length(points: &[Point]) -> f64 {
-    points.windows(2).map(|w| w[0].distance(w[1])).sum()
-}
-
-/// Unit direction of travel at each point, measured `span` points either side
-/// so small wobbles don't flip it.
-fn smoothed_directions(points: &[Point], span: usize) -> Vec<kurbo::Vec2> {
-    let n = points.len();
-    (0..n)
-        .map(|i| {
-            let d = points[(i + span).min(n - 1)] - points[i.saturating_sub(span)];
-            let len = d.hypot();
-            if len < f64::EPSILON {
-                kurbo::Vec2::ZERO
-            } else {
-                d / len
-            }
-        })
-        .collect()
-}
-
-/// Shift points sideways by a smooth, repeatable wobble (up to a quarter of
-/// the local width), different for each `layer`.
-fn jitter(points: &[Point], widths: &[f64], layer: f64) -> Vec<Point> {
-    let directions = smoothed_directions(points, 2);
-    points
-        .iter()
-        .zip(widths)
-        .zip(directions)
-        .enumerate()
-        .map(|(i, ((&p, &w), d))| {
-            let t = i as f64;
-            let wobble =
-                0.6 * (t * 0.37 + layer * 1.7).sin() + 0.4 * (t * 0.11 + layer * 0.9).sin();
-            p + kurbo::Vec2::new(-d.y, d.x) * (wobble * w * 0.25)
-        })
-        .collect()
-}
-
-/// Sample a Catmull-Rom spline through `pts` (and linearly interpolated
-/// pressures) at most `step` apart.
-fn catmull_rom_resample(pts: &[Point], pressure: &[f64], step: f64) -> (Vec<Point>, Vec<f64>) {
-    let n = pts.len();
-    let mut points = vec![pts[0]];
-    let mut pressures = vec![pressure[0]];
-
-    for i in 0..n - 1 {
-        let p0 = pts[i.saturating_sub(1)].to_vec2();
-        let p1 = pts[i].to_vec2();
-        let p2 = pts[i + 1].to_vec2();
-        let p3 = pts[(i + 2).min(n - 1)].to_vec2();
-        let (w1, w2) = (pressure[i], pressure[i + 1]);
-
-        let samples = ((p2 - p1).hypot() / step).ceil().max(1.0) as usize;
-        for j in 1..=samples {
-            let t = j as f64 / samples as f64;
-            let (t2, t3) = (t * t, t * t * t);
-            let p = 0.5
-                * (2.0 * p1
-                    + (p2 - p0) * t
-                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                    + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3);
-            points.push(p.to_point());
-            pressures.push(w1 + (w2 - w1) * t);
-        }
-    }
-    (points, pressures)
-}
-
-/// Continue `path` (currently at `points[0]`) through `points`, using the
-/// points as quadratic control points and segment midpoints as on-curve points.
-fn append_smoothed(path: &mut BezPath, points: &[Point]) {
-    let n = points.len();
-    if n < 3 {
-        if let Some(&last) = points.get(1) {
-            path.line_to(last);
-        }
-        return;
-    }
-    for i in 1..n - 1 {
-        path.quad_to(points[i], points[i].midpoint(points[i + 1]));
-    }
-    path.line_to(points[n - 1]);
-}
-
-/// Append a half circle around `center` from `from` (on the circle) to the
-/// opposite point, turning clockwise in y-down coordinates.
-fn append_round_cap(path: &mut BezPath, (center, radius): (Point, f64), from: Point) {
-    if radius <= f64::EPSILON {
-        return;
-    }
-    let start_angle = (from - center).atan2();
-    let arc = kurbo::Arc::new(
-        center,
-        kurbo::Vec2::new(radius, radius),
-        start_angle,
-        -std::f64::consts::PI,
-        0.0,
-    );
-    path.extend(arc.append_iter(0.1));
 }

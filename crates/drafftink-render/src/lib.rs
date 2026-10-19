@@ -13,9 +13,13 @@ mod vello_impl;
 pub mod rex_backend;
 
 pub use renderer::{
-    AngleSnapInfo, GridStyle, RenderContext, Renderer, RendererError, RotationInfo, WritingGuides,
+    AngleSnapInfo, GridStyle, RenderContext, Renderer, RendererError, RotationInfo,
 };
 pub use text_editor::{TextEditResult, TextEditState, TextKey, TextModifiers};
 
 #[cfg(feature = "vello-renderer")]
 pub use vello_impl::{PngRenderResult, VelloRenderer};
+
+// This fork's additions.
+mod writing_guides;
+pub use writing_guides::WritingGuides;
