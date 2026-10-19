@@ -268,9 +268,9 @@ impl Default for TabletSettings {
             stabilizer: true,
             stabilizer_min_cutoff: 6.0,
             stabilizer_speed: 0.1,
-            tilt_width: 0.0,
+            tilt_width: 0.28,
             calligraphy: false,
-            nib_angle_source: NibAngle::default(),
+            nib_angle_source: NibAngle::TiltDirection,
             nib_angle: 45.0,
             nib_thinness: 0.2,
             hover_fade: true,
@@ -283,14 +283,16 @@ impl Default for TabletSettings {
                 ButtonAction::HoldTool(ToolKind::Select),
             ],
             pad_buttons: vec![
-                ButtonAction::Command(Command::Undo),
+                ButtonAction::SwitchTool(ToolKind::Freehand),
                 ButtonAction::Command(Command::Redo),
-                ButtonAction::Pan,
-                ButtonAction::HoldTool(ToolKind::Eraser),
                 ButtonAction::ToggleTool(ToolKind::Select),
-                ButtonAction::Command(Command::ZoomToFit),
-                ButtonAction::Command(Command::PreviousColor),
-                ButtonAction::Command(Command::NextColor),
+                ButtonAction::Command(Command::Undo),
+                ButtonAction::Command(Command::ZoomIn),
+                ButtonAction::Command(Command::CenterCanvasOrBack),
+                ButtonAction::Command(Command::ZoomOut),
+                ButtonAction::Command(Command::ZoomToFitOrBack),
+                ButtonAction::HoldQuickToolbars,
+                ButtonAction::Command(Command::ZoomResetOrBack),
             ],
             ring_modes: vec![
                 RingAction::Zoom,
@@ -299,7 +301,7 @@ impl Default for TabletSettings {
                 RingAction::UndoRedo,
             ],
             ring_step_degrees: 15.0,
-            dial_actions: vec![RingAction::Zoom, RingAction::StrokeWidth],
+            dial_actions: vec![RingAction::ScrollVertical, RingAction::ScrollHorizontal],
             dial_detents_per_step: 1.0,
             dial_reverse: false,
             strip_modes: vec![RingAction::ScrollVertical],
@@ -469,7 +471,10 @@ mod tests {
 
     #[test]
     fn test_nib_and_tilt() {
-        let mut s = TabletSettings::default();
+        let mut s = TabletSettings {
+            tilt_width: 0.0,
+            ..Default::default()
+        };
         assert_eq!(s.nib_factor(0.0, 0.0), 1.0);
         assert_eq!(s.tilt_factor((30.0, 0.0)), 1.0);
         s.calligraphy = true;
