@@ -732,9 +732,13 @@ impl VelloRenderer {
         let mut first_cap: Option<(Point, f64)> = None;
         let mut last_cap: Option<(Point, f64)> = None;
 
-        for i in 0..freehand.points.len() {
-            let point = freehand.points[i];
-            let pressure = freehand.pressure_at(i);
+        // Input points can be far apart on fast strokes; interpolate a spline
+        // through them so curves don't render as facets.
+        let (points, pressures) = catmull_rom_resample(freehand, 1.5);
+
+        for i in 0..points.len() {
+            let point = points[i];
+            let pressure = pressures[i];
             // Apply easing: sin((pressure * π) / 2)
             let eased_pressure = (pressure * std::f64::consts::PI / 2.0).sin();
             // Apply thinning: size * (1 - thinning * (1 - pressure))
@@ -743,16 +747,16 @@ impl VelloRenderer {
             // Calculate perpendicular direction
             let dir = if i == 0 {
                 // First point: use direction to next point
-                let next = freehand.points[i + 1];
+                let next = points[i + 1];
                 Vec2::new(next.x - point.x, next.y - point.y)
-            } else if i == freehand.points.len() - 1 {
+            } else if i == points.len() - 1 {
                 // Last point: use direction from previous point
-                let prev = freehand.points[i - 1];
+                let prev = points[i - 1];
                 Vec2::new(point.x - prev.x, point.y - prev.y)
             } else {
                 // Middle points: average of incoming and outgoing directions
-                let prev = freehand.points[i - 1];
-                let next = freehand.points[i + 1];
+                let prev = points[i - 1];
+                let next = points[i + 1];
                 Vec2::new(next.x - prev.x, next.y - prev.y)
             };
 
@@ -2561,6 +2565,40 @@ mod tests {
         let ctx = RenderContext::new(&canvas, kurbo::Size::new(800.0, 600.0));
         renderer.build_scene(&ctx);
     }
+}
+
+/// Sample a Catmull-Rom spline through the freehand points (and linearly
+/// interpolated pressures) at most `step` apart.
+fn catmull_rom_resample(
+    freehand: &drafftink_core::shapes::Freehand,
+    step: f64,
+) -> (Vec<Point>, Vec<f64>) {
+    let pts = &freehand.points;
+    let n = pts.len();
+    let mut points = vec![pts[0]];
+    let mut pressures = vec![freehand.pressure_at(0)];
+
+    for i in 0..n - 1 {
+        let p0 = pts[i.saturating_sub(1)].to_vec2();
+        let p1 = pts[i].to_vec2();
+        let p2 = pts[i + 1].to_vec2();
+        let p3 = pts[(i + 2).min(n - 1)].to_vec2();
+        let (w1, w2) = (freehand.pressure_at(i), freehand.pressure_at(i + 1));
+
+        let samples = ((p2 - p1).hypot() / step).ceil().max(1.0) as usize;
+        for j in 1..=samples {
+            let t = j as f64 / samples as f64;
+            let (t2, t3) = (t * t, t * t * t);
+            let p = 0.5
+                * (2.0 * p1
+                    + (p2 - p0) * t
+                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                    + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3);
+            points.push(p.to_point());
+            pressures.push(w1 + (w2 - w1) * t);
+        }
+    }
+    (points, pressures)
 }
 
 /// Continue `path` (currently at `points[0]`) through `points`, using the
