@@ -96,8 +96,10 @@ and **Calligraphy (4 lines)** practice guides, with adjustable x-height,
 ascender and descender, row gap, slant and classic proportions.
 
 Press **Q** (or bind "Tools and colours at pointer" to a pen or tablet button)
-to bring the tools and colours to the pointer: tools to its left, colours above
-it. Tap and click an item, or hold, move onto an item and release.
+to bring the controls to the pointer: tools to its left; fill, stroke width and
+stroke colours above it; and the properties panel to its right. Press again (or
+Esc, or click the canvas) to hide them. Picking a tool hides them; colours,
+widths and properties stay open so you can set several.
 
 **Menu → Handwriting practice ›** and **Calligraphy practice ›** open practice
 sheets in their own tab: every uppercase and lowercase letter, number and symbol

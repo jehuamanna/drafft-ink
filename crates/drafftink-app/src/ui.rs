@@ -629,20 +629,13 @@ pub struct QuickBars {
     pub anchor: Option<Pos2>,
     /// When it opened, in egui time (seconds).
     pub opened_at: f64,
-    /// Item under the pointer: picked when a held hotkey is released.
-    pub hovered: Option<QuickItem>,
 }
 
 impl QuickBars {
-    /// Holding the hotkey at least this long (seconds) means "pick on
-    /// release"; a shorter tap leaves the toolbars open for a click.
-    pub const HOLD: f64 = 0.3;
-
     pub fn new(now: f64) -> Self {
         Self {
             anchor: None,
             opened_at: now,
-            hovered: None,
         }
     }
 }
@@ -652,6 +645,8 @@ impl QuickBars {
 pub enum QuickItem {
     Tool(ToolKind),
     Color(Color32),
+    Fill(Option<Color32>),
+    Width(f32),
 }
 
 impl QuickItem {
@@ -659,6 +654,8 @@ impl QuickItem {
         match self {
             QuickItem::Tool(tool) => UiAction::SetTool(tool),
             QuickItem::Color(color) => UiAction::SetStrokeColor(color),
+            QuickItem::Fill(color) => UiAction::SetFillColor(color),
+            QuickItem::Width(width) => UiAction::SetStrokeWidth(width),
         }
     }
 }
@@ -743,7 +740,7 @@ pub fn render_ui(
 ) -> Option<UiAction> {
     egui_extras::install_image_loaders(ctx);
 
-    let quick_action = render_quick_bars(ctx, ui_state);
+    let quick_action = render_quick_bars(ctx, ui_state, selected_props);
     let toolbar_action = render_toolbar(ctx, ui_state);
     let properties_action = render_properties_panel(ctx, ui_state);
     let file_action = render_file_menu(ctx, ui_state);
@@ -887,10 +884,15 @@ fn render_toolbar(ctx: &Context, ui_state: &UiState) -> Option<UiAction> {
 }
 
 /// Render the quick toolbars around the pointer: tools in a column to its
-/// left and colours in rows above it, meeting at the pointer's upper-left so
-/// everything is a short move away. The items most used sit nearest the
-/// pointer (the pen tools and the quick colours).
-fn render_quick_bars(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
+/// left, fill, stroke width and stroke colours above it, and the properties
+/// panel to its right, so everything is a short move away. The items most
+/// used sit nearest the pointer (the pen tools and the quick colours).
+/// Picking a tool closes them; style changes keep them open.
+fn render_quick_bars(
+    ctx: &Context,
+    ui_state: &mut UiState,
+    props: &SelectedShapeProps,
+) -> Option<UiAction> {
     let mut bars = ui_state.quick_bars?;
     let now = ctx.input(|i| i.time);
     let anchor = *bars.anchor.get_or_insert_with(|| {
@@ -907,8 +909,6 @@ fn render_quick_bars(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> 
     let slide = (1.0 - ease) * 10.0;
     const GAP: f32 = 14.0;
 
-    let pointer = ctx.input(|i| i.pointer.hover_pos());
-    let mut hovered = None;
     let mut action = None;
 
     // Tools: two columns, the drawing tools in the column next to the pointer.
@@ -948,9 +948,6 @@ fn render_quick_bars(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> 
                                 if response.inner {
                                     action = Some(QuickItem::Tool(tool.kind));
                                 }
-                                if pointer.is_some_and(|p| response.response.rect.contains(p)) {
-                                    hovered = Some(QuickItem::Tool(tool.kind));
-                                }
                             }
                         });
                     }
@@ -971,6 +968,22 @@ fn render_quick_bars(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> 
         .collect();
     let mut rows: Vec<&[(Color32, &str)]> = others.chunks(quick.len()).collect();
     rows.push(&quick);
+    let fills: Vec<(Color32, &str)> = QUICK_COLORS
+        .iter()
+        .map(|&i| (TAILWIND_COLORS[i].shades[1], TAILWIND_COLORS[i].name))
+        .chain(
+            QUICK_COLORS
+                .iter()
+                .map(|&i| (TAILWIND_COLORS[i].shades[6], TAILWIND_COLORS[i].name)),
+        )
+        .collect();
+    let section = |ui: &mut egui::Ui, text: &str| {
+        ui.label(
+            egui::RichText::new(text)
+                .size(10.0)
+                .color(Color32::from_gray(120)),
+        );
+    };
     egui::Area::new(egui::Id::new("quick_colors"))
         .order(egui::Order::Foreground)
         .pivot(Align2::LEFT_BOTTOM)
@@ -980,28 +993,77 @@ fn render_quick_bars(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> 
             ui.set_opacity(ease);
             panel_frame().show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                let mut item = |quick: QuickItem, clicked: bool| {
+                    if clicked {
+                        action = Some(quick);
+                    }
+                };
+
+                section(ui, "Fill");
+                ui.horizontal(|ui| {
+                    let response = ui.scope(|ui| {
+                        NoColorSwatch::new("No fill")
+                            .selected(ui_state.fill_color.is_none())
+                            .show(ui)
+                    });
+                    item(QuickItem::Fill(None), response.inner);
+                    for &(color, name) in &fills {
+                        let (clicked, _) = ColorSwatch::new(color, name)
+                            .selected(ui_state.fill_color == Some(color))
+                            .show(ui);
+                        item(QuickItem::Fill(Some(color)), clicked);
+                    }
+                });
+
+                section(ui, "Stroke width");
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
+                    for &(width, name) in STROKE_WIDTH_PRESETS.iter() {
+                        let tooltip = format!("{name} ({width} px)");
+                        let selected = (ui_state.stroke_width - width).abs() < 0.01;
+                        let response = ui
+                            .scope(|ui| StrokeWidthButton::new(width, &tooltip, selected).show(ui));
+                        item(QuickItem::Width(width), response.inner);
+                    }
+                });
+
+                section(ui, "Stroke");
                 for row in &rows {
                     ui.horizontal(|ui| {
                         for &(color, name) in *row {
-                            let (clicked, rect) = ColorSwatch::new(color, name)
+                            let (clicked, _) = ColorSwatch::new(color, name)
                                 .style(drafftink_widgets::ColorSwatchStyle::large())
                                 .selected(ui_state.stroke_color == color)
                                 .show(ui);
-                            if clicked {
-                                action = Some(QuickItem::Color(color));
-                            }
-                            if pointer.is_some_and(|p| rect.contains(p)) {
-                                hovered = Some(QuickItem::Color(color));
-                            }
+                            item(QuickItem::Color(color), clicked);
                         }
                     });
                 }
             });
         });
 
-    bars.hovered = hovered;
-    ui_state.quick_bars = if action.is_some() { None } else { Some(bars) };
-    action.map(QuickItem::action)
+    // Properties of the selection or tool, to the right of the pointer.
+    let mut props_action = None;
+    if props.has_selection || props.is_drawing_tool {
+        egui::Area::new(egui::Id::new("quick_properties"))
+            .order(egui::Order::Foreground)
+            .pivot(Align2::LEFT_TOP)
+            .fixed_pos(anchor + Vec2::new(GAP - slide, -4.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                ui.set_opacity(ease);
+                panel_frame().show(ui, |ui| {
+                    ui.set_width(176.0);
+                    props_action = properties_contents(ui, props);
+                });
+            });
+    }
+
+    // Picking a tool closes the toolbars (you'll draw next); colours, widths
+    // and properties keep them open so several can be set in one go.
+    let picked_tool = matches!(action, Some(QuickItem::Tool(_)));
+    ui_state.quick_bars = if picked_tool { None } else { Some(bars) };
+    action.map(QuickItem::action).or(props_action)
 }
 
 /// Render the bottom-left toolbar with grid toggle and zoom controls.
@@ -1825,6 +1887,514 @@ fn writing_guides_editor(ui: &mut egui::Ui, guides: &mut WritingGuides, stroke_w
     }
 }
 
+/// The properties panel's contents, shared by the side panel and the
+/// toolbars at the pointer.
+fn properties_contents(ui: &mut egui::Ui, props: &SelectedShapeProps) -> Option<UiAction> {
+    let mut action = None;
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
+
+        // Panel title
+        ui.label(
+            egui::RichText::new("Properties")
+                .size(14.0)
+                .strong()
+                .color(Color32::from_gray(60)),
+        );
+        ui.add_space(4.0);
+
+        // Text-specific properties
+        if props.is_text {
+            // Font Family
+            ui.label(
+                egui::RichText::new("Font Family")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                let is_gelpen = props.font_family == FontFamily::GelPen;
+                if ToggleButton::new("GelPen", is_gelpen).show(ui) && !is_gelpen {
+                    action = Some(UiAction::SetFontFamily(0));
+                }
+
+                let is_gelpen_serif = props.font_family == FontFamily::GelPenSerif;
+                if ToggleButton::new("GelPen Serif", is_gelpen_serif).show(ui) && !is_gelpen_serif {
+                    action = Some(UiAction::SetFontFamily(2));
+                }
+
+                // TODO: Re-enable Noto Sans once font rendering is finalized
+                // let is_noto = props.font_family == FontFamily::NotoSans;
+                // if ToggleButton::new("Noto", is_noto).show(ui) && !is_noto
+                // {
+                //     action = Some(UiAction::SetFontFamily(1));
+                // }
+
+                let is_vanilla = props.font_family == FontFamily::VanillaExtract;
+                if ToggleButton::new("Vanilla", is_vanilla).show(ui) && !is_vanilla {
+                    action = Some(UiAction::SetFontFamily(3));
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Font Weight
+            ui.label(
+                egui::RichText::new("Font Weight")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                let is_light = props.font_weight == FontWeight::Light;
+                if ToggleButton::new("Light", is_light).show(ui) && !is_light {
+                    action = Some(UiAction::SetFontWeight(0));
+                }
+
+                let is_regular = props.font_weight == FontWeight::Regular;
+                if ToggleButton::new("Regular", is_regular).show(ui) && !is_regular {
+                    action = Some(UiAction::SetFontWeight(1));
+                }
+
+                let is_heavy = props.font_weight == FontWeight::Heavy;
+                if ToggleButton::new("Heavy", is_heavy).show(ui) && !is_heavy {
+                    action = Some(UiAction::SetFontWeight(2));
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Font Size - S/M/L/XL buttons
+            ui.label(
+                egui::RichText::new("Font Size")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                // S = 16px
+                let is_small = (props.font_size - 16.0).abs() < 1.0;
+                if FontSizeButton::new("S", 16.0, is_small).show(ui) {
+                    action = Some(UiAction::SetFontSize(16.0));
+                }
+
+                // M = 20px (default)
+                let is_medium = (props.font_size - 20.0).abs() < 1.0;
+                if FontSizeButton::new("M", 20.0, is_medium).show(ui) {
+                    action = Some(UiAction::SetFontSize(20.0));
+                }
+
+                // L = 28px
+                let is_large = (props.font_size - 28.0).abs() < 1.0;
+                if FontSizeButton::new("L", 28.0, is_large).show(ui) {
+                    action = Some(UiAction::SetFontSize(28.0));
+                }
+
+                // XL = 36px
+                let is_xlarge = (props.font_size - 36.0).abs() < 1.0;
+                if FontSizeButton::new("XL", 36.0, is_xlarge).show(ui) {
+                    action = Some(UiAction::SetFontSize(36.0));
+                }
+            });
+        }
+
+        // Math-specific properties (font size only)
+        if props.is_math {
+            ui.label(
+                egui::RichText::new("Font Size")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                let is_small = (props.font_size - 16.0).abs() < 1.0;
+                if FontSizeButton::new("S", 16.0, is_small).show(ui) {
+                    action = Some(UiAction::SetMathFontSize(16.0));
+                }
+
+                let is_medium = (props.font_size - 20.0).abs() < 1.0;
+                if FontSizeButton::new("M", 20.0, is_medium).show(ui) {
+                    action = Some(UiAction::SetMathFontSize(20.0));
+                }
+
+                let is_large = (props.font_size - 28.0).abs() < 1.0;
+                if FontSizeButton::new("L", 28.0, is_large).show(ui) {
+                    action = Some(UiAction::SetMathFontSize(28.0));
+                }
+
+                let is_xlarge = (props.font_size - 36.0).abs() < 1.0;
+                if FontSizeButton::new("XL", 36.0, is_xlarge).show(ui) {
+                    action = Some(UiAction::SetMathFontSize(36.0));
+                }
+            });
+        }
+
+        // Rectangle-specific properties (for selected rect OR rectangle tool)
+        if props.is_rectangle || props.tool_is_rectangle {
+            // Corner Radius - On/Off toggle
+            ui.label(
+                egui::RichText::new("Rounded Corners")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                // Off = 0px (sharp corners)
+                let is_off = props.corner_radius < 1.0;
+                if ToggleButton::new("Off", is_off).show(ui) && !is_off {
+                    action = Some(UiAction::SetCornerRadius(0.0));
+                }
+
+                // On = 32px (adaptive radius)
+                let is_on = props.corner_radius >= 1.0;
+                if ToggleButton::new("On", is_on).show(ui) && !is_on {
+                    action = Some(UiAction::SetCornerRadius(32.0));
+                }
+            });
+        }
+
+        // Sloppiness (for all shapes except text and freehand/highlighter)
+        if !props.is_text && !props.is_freehand {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Sloppiness")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                // Architect = 0 (clean lines)
+                let is_architect = props.sloppiness == 0;
+                if ToggleButton::new("Architect", is_architect).show(ui) && !is_architect {
+                    action = Some(UiAction::SetSloppiness(0));
+                }
+
+                // Artist = 1 (slight wobble)
+                let is_artist = props.sloppiness == 1;
+                if ToggleButton::new("Artist", is_artist).show(ui) && !is_artist {
+                    action = Some(UiAction::SetSloppiness(1));
+                }
+
+                // Cartoonist = 2 (very sketchy)
+                let is_cartoonist = props.sloppiness == 2;
+                if ToggleButton::new("Cartoonist", is_cartoonist).show(ui) && !is_cartoonist {
+                    action = Some(UiAction::SetSloppiness(2));
+                }
+
+                // Drunk = 3 (chaotic)
+                let is_drunk = props.sloppiness == 3;
+                if ToggleButton::new("Drunk", is_drunk).show(ui) && !is_drunk {
+                    action = Some(UiAction::SetSloppiness(3));
+                }
+            });
+        }
+
+        // Fill pattern (only for shapes with fill, not lines/arrows/freehand)
+        if props.has_fill && !props.is_line && !props.is_arrow && !props.is_freehand {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Fill Pattern")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                let patterns = [(0u8, "Solid"), (1, "Hatch"), (3, "Cross"), (4, "Dots")];
+                for (idx, name) in patterns {
+                    let is_selected = props.fill_pattern == idx;
+                    if ToggleButton::new(name, is_selected).show(ui) && !is_selected {
+                        action = Some(UiAction::SetFillPattern(idx));
+                    }
+                }
+            });
+        }
+
+        // Path style (for lines and arrows only)
+        if props.is_line || props.is_arrow {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Path")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                let is_direct = props.path_style == 0;
+                if ToggleButton::new("Direct", is_direct).show(ui) && !is_direct {
+                    action = Some(UiAction::SetPathStyle(0));
+                }
+
+                let is_flowing = props.path_style == 1;
+                if ToggleButton::new("Flowing", is_flowing).show(ui) && !is_flowing {
+                    action = Some(UiAction::SetPathStyle(1));
+                }
+
+                let is_angular = props.path_style == 2;
+                if ToggleButton::new("Angular", is_angular).show(ui) && !is_angular {
+                    action = Some(UiAction::SetPathStyle(2));
+                }
+            });
+
+            // Stroke style (solid/dashed/dotted)
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new("Stroke")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                let is_solid = props.stroke_style == 0;
+                if ToggleButton::new("Solid", is_solid).show(ui) && !is_solid {
+                    action = Some(UiAction::SetStrokeStyle(0));
+                }
+
+                let is_dashed = props.stroke_style == 1;
+                if ToggleButton::new("Dashed", is_dashed).show(ui) && !is_dashed {
+                    action = Some(UiAction::SetStrokeStyle(1));
+                }
+
+                let is_dotted = props.stroke_style == 2;
+                if ToggleButton::new("Dotted", is_dotted).show(ui) && !is_dotted {
+                    action = Some(UiAction::SetStrokeStyle(2));
+                }
+            });
+        }
+
+        // Brush (pen tool and pen strokes)
+        if let Some(current) = props.brush {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Brush")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
+                for brush in Brush::ALL {
+                    if ToggleButton::new(brush.name(), current == brush).show(ui)
+                        && current != brush
+                    {
+                        action = Some(UiAction::SetBrush(brush));
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(current.description())
+                    .size(10.0)
+                    .color(Color32::from_gray(120)),
+            );
+            if current == Brush::BroadNib {
+                let mut angle = props.nib_angle;
+                let slider = egui::Slider::new(&mut angle, 0.0..=90.0)
+                    .suffix("°")
+                    .text("Nib angle");
+                if ui
+                    .add(slider)
+                    .on_hover_text(
+                        "Angle of the nib edge from horizontal. \
+                         Foundational 30°, italic 40-45°, blackletter 35-40°",
+                    )
+                    .changed()
+                {
+                    action = Some(UiAction::SetNibAngle(angle.round()));
+                }
+            }
+        }
+
+        // Motion smoothing (for freehand tool only)
+        if props.is_freehand {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Motion")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                if ToggleButton::new("Direct", !props.calligraphy_mode).show(ui)
+                    && props.calligraphy_mode
+                {
+                    action = Some(UiAction::ToggleCalligraphy);
+                }
+                if ToggleButton::new("Smoothed", props.calligraphy_mode).show(ui)
+                    && !props.calligraphy_mode
+                {
+                    action = Some(UiAction::ToggleCalligraphy);
+                }
+            });
+
+            // Pressure simulation toggle
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+                if ToggleButton::new("Uniform", !props.pressure_simulation).show(ui)
+                    && props.pressure_simulation
+                {
+                    action = Some(UiAction::TogglePressureSimulation);
+                }
+                if ToggleButton::new("Pressure", props.pressure_simulation).show(ui)
+                    && !props.pressure_simulation
+                {
+                    action = Some(UiAction::TogglePressureSimulation);
+                }
+            });
+        }
+
+        // Z-Order controls (only when shapes are selected, not for drawing tools)
+        if props.has_selection && !props.is_drawing_tool {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Layer")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                // Back (send to bottommost)
+                if IconButton::new(include_image!("../assets/layer-back.svg"), "Send to Back")
+                    .show(ui)
+                {
+                    action = Some(UiAction::SendToBack);
+                }
+
+                // Backward (one layer down)
+                if IconButton::new(
+                    include_image!("../assets/layer-backward.svg"),
+                    "Send Backward",
+                )
+                .show(ui)
+                {
+                    action = Some(UiAction::SendBackward);
+                }
+
+                // Forward (one layer up)
+                if IconButton::new(
+                    include_image!("../assets/layer-forward.svg"),
+                    "Bring Forward",
+                )
+                .show(ui)
+                {
+                    action = Some(UiAction::BringForward);
+                }
+
+                // Front (bring to topmost)
+                if IconButton::new(
+                    include_image!("../assets/layer-front.svg"),
+                    "Bring to Front",
+                )
+                .show(ui)
+                {
+                    action = Some(UiAction::BringToFront);
+                }
+            });
+
+            // Flip/Mirror controls
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Transform")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                if IconButton::new(include_image!("../assets/flip-h.svg"), "Flip Horizontal")
+                    .show(ui)
+                {
+                    action = Some(UiAction::FlipHorizontal);
+                }
+                if IconButton::new(include_image!("../assets/flip-v.svg"), "Flip Vertical").show(ui)
+                {
+                    action = Some(UiAction::FlipVertical);
+                }
+            });
+
+            // Opacity control
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Opacity")
+                    .size(11.0)
+                    .color(Color32::from_gray(100)),
+            );
+            ui.horizontal(|ui| {
+                let mut opacity = props.opacity;
+                let slider = egui::Slider::new(&mut opacity, 0.0..=1.0)
+                    .show_value(false)
+                    .custom_formatter(|v, _| format!("{}%", (v * 100.0) as i32));
+                if ui.add(slider).changed() {
+                    action = Some(UiAction::SetOpacity(opacity));
+                }
+                ui.label(
+                    egui::RichText::new(format!("{}%", (props.opacity * 100.0) as i32))
+                        .size(11.0)
+                        .color(Color32::from_gray(100)),
+                );
+            });
+
+            // Alignment controls (only when 2+ shapes are selected)
+            if props.selection_count >= 2 {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("Align")
+                        .size(11.0)
+                        .color(Color32::from_gray(100)),
+                );
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
+
+                    if IconButton::new(include_image!("../assets/align-left.svg"), "Align Left")
+                        .show(ui)
+                    {
+                        action = Some(UiAction::AlignLeft);
+                    }
+                    if IconButton::new(
+                        include_image!("../assets/align-center-v.svg"),
+                        "Align Center (Vertical)",
+                    )
+                    .show(ui)
+                    {
+                        action = Some(UiAction::AlignCenterV);
+                    }
+                    if IconButton::new(include_image!("../assets/align-right.svg"), "Align Right")
+                        .show(ui)
+                    {
+                        action = Some(UiAction::AlignRight);
+                    }
+                    if IconButton::new(include_image!("../assets/align-top.svg"), "Align Top")
+                        .show(ui)
+                    {
+                        action = Some(UiAction::AlignTop);
+                    }
+                    if IconButton::new(
+                        include_image!("../assets/align-center-h.svg"),
+                        "Align Center (Horizontal)",
+                    )
+                    .show(ui)
+                    {
+                        action = Some(UiAction::AlignCenterH);
+                    }
+                    if IconButton::new(include_image!("../assets/align-bottom.svg"), "Align Bottom")
+                        .show(ui)
+                    {
+                        action = Some(UiAction::AlignBottom);
+                    }
+                });
+            }
+        }
+    });
+    action
+}
+
 /// Render the right-side properties panel for selected shapes.
 fn render_right_panel(ctx: &Context, props: &SelectedShapeProps) -> Option<UiAction> {
     // Show panel if shape is selected OR if a drawing tool is active
@@ -1855,545 +2425,7 @@ fn render_right_panel(ctx: &Context, props: &SelectedShapeProps) -> Option<UiAct
                 .show(ui, |ui| {
                     ui.set_width(panel_width - 24.0);
 
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(0.0, 8.0);
-
-                        // Panel title
-                        ui.label(
-                            egui::RichText::new("Properties")
-                                .size(14.0)
-                                .strong()
-                                .color(Color32::from_gray(60)),
-                        );
-                        ui.add_space(4.0);
-
-                        // Text-specific properties
-                        if props.is_text {
-                            // Font Family
-                            ui.label(
-                                egui::RichText::new("Font Family")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                let is_gelpen = props.font_family == FontFamily::GelPen;
-                                if ToggleButton::new("GelPen", is_gelpen).show(ui) && !is_gelpen {
-                                    action = Some(UiAction::SetFontFamily(0));
-                                }
-
-                                let is_gelpen_serif = props.font_family == FontFamily::GelPenSerif;
-                                if ToggleButton::new("GelPen Serif", is_gelpen_serif).show(ui)
-                                    && !is_gelpen_serif
-                                {
-                                    action = Some(UiAction::SetFontFamily(2));
-                                }
-
-                                // TODO: Re-enable Noto Sans once font rendering is finalized
-                                // let is_noto = props.font_family == FontFamily::NotoSans;
-                                // if ToggleButton::new("Noto", is_noto).show(ui) && !is_noto
-                                // {
-                                //     action = Some(UiAction::SetFontFamily(1));
-                                // }
-
-                                let is_vanilla = props.font_family == FontFamily::VanillaExtract;
-                                if ToggleButton::new("Vanilla", is_vanilla).show(ui) && !is_vanilla
-                                {
-                                    action = Some(UiAction::SetFontFamily(3));
-                                }
-                            });
-
-                            ui.add_space(4.0);
-
-                            // Font Weight
-                            ui.label(
-                                egui::RichText::new("Font Weight")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                let is_light = props.font_weight == FontWeight::Light;
-                                if ToggleButton::new("Light", is_light).show(ui) && !is_light {
-                                    action = Some(UiAction::SetFontWeight(0));
-                                }
-
-                                let is_regular = props.font_weight == FontWeight::Regular;
-                                if ToggleButton::new("Regular", is_regular).show(ui) && !is_regular
-                                {
-                                    action = Some(UiAction::SetFontWeight(1));
-                                }
-
-                                let is_heavy = props.font_weight == FontWeight::Heavy;
-                                if ToggleButton::new("Heavy", is_heavy).show(ui) && !is_heavy {
-                                    action = Some(UiAction::SetFontWeight(2));
-                                }
-                            });
-
-                            ui.add_space(4.0);
-
-                            // Font Size - S/M/L/XL buttons
-                            ui.label(
-                                egui::RichText::new("Font Size")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                // S = 16px
-                                let is_small = (props.font_size - 16.0).abs() < 1.0;
-                                if FontSizeButton::new("S", 16.0, is_small).show(ui) {
-                                    action = Some(UiAction::SetFontSize(16.0));
-                                }
-
-                                // M = 20px (default)
-                                let is_medium = (props.font_size - 20.0).abs() < 1.0;
-                                if FontSizeButton::new("M", 20.0, is_medium).show(ui) {
-                                    action = Some(UiAction::SetFontSize(20.0));
-                                }
-
-                                // L = 28px
-                                let is_large = (props.font_size - 28.0).abs() < 1.0;
-                                if FontSizeButton::new("L", 28.0, is_large).show(ui) {
-                                    action = Some(UiAction::SetFontSize(28.0));
-                                }
-
-                                // XL = 36px
-                                let is_xlarge = (props.font_size - 36.0).abs() < 1.0;
-                                if FontSizeButton::new("XL", 36.0, is_xlarge).show(ui) {
-                                    action = Some(UiAction::SetFontSize(36.0));
-                                }
-                            });
-                        }
-
-                        // Math-specific properties (font size only)
-                        if props.is_math {
-                            ui.label(
-                                egui::RichText::new("Font Size")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                let is_small = (props.font_size - 16.0).abs() < 1.0;
-                                if FontSizeButton::new("S", 16.0, is_small).show(ui) {
-                                    action = Some(UiAction::SetMathFontSize(16.0));
-                                }
-
-                                let is_medium = (props.font_size - 20.0).abs() < 1.0;
-                                if FontSizeButton::new("M", 20.0, is_medium).show(ui) {
-                                    action = Some(UiAction::SetMathFontSize(20.0));
-                                }
-
-                                let is_large = (props.font_size - 28.0).abs() < 1.0;
-                                if FontSizeButton::new("L", 28.0, is_large).show(ui) {
-                                    action = Some(UiAction::SetMathFontSize(28.0));
-                                }
-
-                                let is_xlarge = (props.font_size - 36.0).abs() < 1.0;
-                                if FontSizeButton::new("XL", 36.0, is_xlarge).show(ui) {
-                                    action = Some(UiAction::SetMathFontSize(36.0));
-                                }
-                            });
-                        }
-
-                        // Rectangle-specific properties (for selected rect OR rectangle tool)
-                        if props.is_rectangle || props.tool_is_rectangle {
-                            // Corner Radius - On/Off toggle
-                            ui.label(
-                                egui::RichText::new("Rounded Corners")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                // Off = 0px (sharp corners)
-                                let is_off = props.corner_radius < 1.0;
-                                if ToggleButton::new("Off", is_off).show(ui) && !is_off {
-                                    action = Some(UiAction::SetCornerRadius(0.0));
-                                }
-
-                                // On = 32px (adaptive radius)
-                                let is_on = props.corner_radius >= 1.0;
-                                if ToggleButton::new("On", is_on).show(ui) && !is_on {
-                                    action = Some(UiAction::SetCornerRadius(32.0));
-                                }
-                            });
-                        }
-
-                        // Sloppiness (for all shapes except text and freehand/highlighter)
-                        if !props.is_text && !props.is_freehand {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Sloppiness")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                // Architect = 0 (clean lines)
-                                let is_architect = props.sloppiness == 0;
-                                if ToggleButton::new("Architect", is_architect).show(ui)
-                                    && !is_architect
-                                {
-                                    action = Some(UiAction::SetSloppiness(0));
-                                }
-
-                                // Artist = 1 (slight wobble)
-                                let is_artist = props.sloppiness == 1;
-                                if ToggleButton::new("Artist", is_artist).show(ui) && !is_artist {
-                                    action = Some(UiAction::SetSloppiness(1));
-                                }
-
-                                // Cartoonist = 2 (very sketchy)
-                                let is_cartoonist = props.sloppiness == 2;
-                                if ToggleButton::new("Cartoonist", is_cartoonist).show(ui)
-                                    && !is_cartoonist
-                                {
-                                    action = Some(UiAction::SetSloppiness(2));
-                                }
-
-                                // Drunk = 3 (chaotic)
-                                let is_drunk = props.sloppiness == 3;
-                                if ToggleButton::new("Drunk", is_drunk).show(ui) && !is_drunk {
-                                    action = Some(UiAction::SetSloppiness(3));
-                                }
-                            });
-                        }
-
-                        // Fill pattern (only for shapes with fill, not lines/arrows/freehand)
-                        if props.has_fill && !props.is_line && !props.is_arrow && !props.is_freehand
-                        {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Fill Pattern")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                                let patterns =
-                                    [(0u8, "Solid"), (1, "Hatch"), (3, "Cross"), (4, "Dots")];
-                                for (idx, name) in patterns {
-                                    let is_selected = props.fill_pattern == idx;
-                                    if ToggleButton::new(name, is_selected).show(ui) && !is_selected
-                                    {
-                                        action = Some(UiAction::SetFillPattern(idx));
-                                    }
-                                }
-                            });
-                        }
-
-                        // Path style (for lines and arrows only)
-                        if props.is_line || props.is_arrow {
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Path")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                let is_direct = props.path_style == 0;
-                                if ToggleButton::new("Direct", is_direct).show(ui) && !is_direct {
-                                    action = Some(UiAction::SetPathStyle(0));
-                                }
-
-                                let is_flowing = props.path_style == 1;
-                                if ToggleButton::new("Flowing", is_flowing).show(ui) && !is_flowing
-                                {
-                                    action = Some(UiAction::SetPathStyle(1));
-                                }
-
-                                let is_angular = props.path_style == 2;
-                                if ToggleButton::new("Angular", is_angular).show(ui) && !is_angular
-                                {
-                                    action = Some(UiAction::SetPathStyle(2));
-                                }
-                            });
-
-                            // Stroke style (solid/dashed/dotted)
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new("Stroke")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                let is_solid = props.stroke_style == 0;
-                                if ToggleButton::new("Solid", is_solid).show(ui) && !is_solid {
-                                    action = Some(UiAction::SetStrokeStyle(0));
-                                }
-
-                                let is_dashed = props.stroke_style == 1;
-                                if ToggleButton::new("Dashed", is_dashed).show(ui) && !is_dashed {
-                                    action = Some(UiAction::SetStrokeStyle(1));
-                                }
-
-                                let is_dotted = props.stroke_style == 2;
-                                if ToggleButton::new("Dotted", is_dotted).show(ui) && !is_dotted {
-                                    action = Some(UiAction::SetStrokeStyle(2));
-                                }
-                            });
-                        }
-
-                        // Brush (pen tool and pen strokes)
-                        if let Some(current) = props.brush {
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Brush")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-                                for brush in Brush::ALL {
-                                    if ToggleButton::new(brush.name(), current == brush).show(ui)
-                                        && current != brush
-                                    {
-                                        action = Some(UiAction::SetBrush(brush));
-                                    }
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(current.description())
-                                    .size(10.0)
-                                    .color(Color32::from_gray(120)),
-                            );
-                            if current == Brush::BroadNib {
-                                let mut angle = props.nib_angle;
-                                let slider = egui::Slider::new(&mut angle, 0.0..=90.0)
-                                    .suffix("°")
-                                    .text("Nib angle");
-                                if ui
-                                    .add(slider)
-                                    .on_hover_text(
-                                        "Angle of the nib edge from horizontal. \
-                                         Foundational 30°, italic 40-45°, blackletter 35-40°",
-                                    )
-                                    .changed()
-                                {
-                                    action = Some(UiAction::SetNibAngle(angle.round()));
-                                }
-                            }
-                        }
-
-                        // Motion smoothing (for freehand tool only)
-                        if props.is_freehand {
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Motion")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                                if ToggleButton::new("Direct", !props.calligraphy_mode).show(ui)
-                                    && props.calligraphy_mode
-                                {
-                                    action = Some(UiAction::ToggleCalligraphy);
-                                }
-                                if ToggleButton::new("Smoothed", props.calligraphy_mode).show(ui)
-                                    && !props.calligraphy_mode
-                                {
-                                    action = Some(UiAction::ToggleCalligraphy);
-                                }
-                            });
-
-                            // Pressure simulation toggle
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-                                if ToggleButton::new("Uniform", !props.pressure_simulation).show(ui)
-                                    && props.pressure_simulation
-                                {
-                                    action = Some(UiAction::TogglePressureSimulation);
-                                }
-                                if ToggleButton::new("Pressure", props.pressure_simulation).show(ui)
-                                    && !props.pressure_simulation
-                                {
-                                    action = Some(UiAction::TogglePressureSimulation);
-                                }
-                            });
-                        }
-
-                        // Z-Order controls (only when shapes are selected, not for drawing tools)
-                        if props.has_selection && !props.is_drawing_tool {
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Layer")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                // Back (send to bottommost)
-                                if IconButton::new(
-                                    include_image!("../assets/layer-back.svg"),
-                                    "Send to Back",
-                                )
-                                .show(ui)
-                                {
-                                    action = Some(UiAction::SendToBack);
-                                }
-
-                                // Backward (one layer down)
-                                if IconButton::new(
-                                    include_image!("../assets/layer-backward.svg"),
-                                    "Send Backward",
-                                )
-                                .show(ui)
-                                {
-                                    action = Some(UiAction::SendBackward);
-                                }
-
-                                // Forward (one layer up)
-                                if IconButton::new(
-                                    include_image!("../assets/layer-forward.svg"),
-                                    "Bring Forward",
-                                )
-                                .show(ui)
-                                {
-                                    action = Some(UiAction::BringForward);
-                                }
-
-                                // Front (bring to topmost)
-                                if IconButton::new(
-                                    include_image!("../assets/layer-front.svg"),
-                                    "Bring to Front",
-                                )
-                                .show(ui)
-                                {
-                                    action = Some(UiAction::BringToFront);
-                                }
-                            });
-
-                            // Flip/Mirror controls
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Transform")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                if IconButton::new(
-                                    include_image!("../assets/flip-h.svg"),
-                                    "Flip Horizontal",
-                                )
-                                .show(ui)
-                                {
-                                    action = Some(UiAction::FlipHorizontal);
-                                }
-                                if IconButton::new(
-                                    include_image!("../assets/flip-v.svg"),
-                                    "Flip Vertical",
-                                )
-                                .show(ui)
-                                {
-                                    action = Some(UiAction::FlipVertical);
-                                }
-                            });
-
-                            // Opacity control
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("Opacity")
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                            );
-                            ui.horizontal(|ui| {
-                                let mut opacity = props.opacity;
-                                let slider = egui::Slider::new(&mut opacity, 0.0..=1.0)
-                                    .show_value(false)
-                                    .custom_formatter(|v, _| format!("{}%", (v * 100.0) as i32));
-                                if ui.add(slider).changed() {
-                                    action = Some(UiAction::SetOpacity(opacity));
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}%",
-                                        (props.opacity * 100.0) as i32
-                                    ))
-                                    .size(11.0)
-                                    .color(Color32::from_gray(100)),
-                                );
-                            });
-
-                            // Alignment controls (only when 2+ shapes are selected)
-                            if props.selection_count >= 2 {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    egui::RichText::new("Align")
-                                        .size(11.0)
-                                        .color(Color32::from_gray(100)),
-                                );
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-
-                                    if IconButton::new(
-                                        include_image!("../assets/align-left.svg"),
-                                        "Align Left",
-                                    )
-                                    .show(ui)
-                                    {
-                                        action = Some(UiAction::AlignLeft);
-                                    }
-                                    if IconButton::new(
-                                        include_image!("../assets/align-center-v.svg"),
-                                        "Align Center (Vertical)",
-                                    )
-                                    .show(ui)
-                                    {
-                                        action = Some(UiAction::AlignCenterV);
-                                    }
-                                    if IconButton::new(
-                                        include_image!("../assets/align-right.svg"),
-                                        "Align Right",
-                                    )
-                                    .show(ui)
-                                    {
-                                        action = Some(UiAction::AlignRight);
-                                    }
-                                    if IconButton::new(
-                                        include_image!("../assets/align-top.svg"),
-                                        "Align Top",
-                                    )
-                                    .show(ui)
-                                    {
-                                        action = Some(UiAction::AlignTop);
-                                    }
-                                    if IconButton::new(
-                                        include_image!("../assets/align-center-h.svg"),
-                                        "Align Center (Horizontal)",
-                                    )
-                                    .show(ui)
-                                    {
-                                        action = Some(UiAction::AlignCenterH);
-                                    }
-                                    if IconButton::new(
-                                        include_image!("../assets/align-bottom.svg"),
-                                        "Align Bottom",
-                                    )
-                                    .show(ui)
-                                    {
-                                        action = Some(UiAction::AlignBottom);
-                                    }
-                                });
-                            }
-                        }
-                    });
+                    action = properties_contents(ui, props);
                 });
         });
 

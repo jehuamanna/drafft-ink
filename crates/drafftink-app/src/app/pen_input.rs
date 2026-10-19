@@ -10,7 +10,6 @@ use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 
 use super::App;
-use crate::keybindings::Command;
 use crate::tablet::{
     Devices, OneEuroFilter, PenInfo, PenKind, PenSample, PinchPhase, StylusButton, TabletEvent,
 };
@@ -436,7 +435,6 @@ impl App {
                     }
                 }
             }
-            ButtonAction::Command(Command::QuickToolbars) => self.quick_toolbars_key(pressed),
             _ if !pressed => {}
             ButtonAction::SwitchTool(tool) => {
                 if !self.pen.down {

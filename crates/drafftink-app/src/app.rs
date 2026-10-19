@@ -46,6 +46,28 @@ pub mod file_ops {
     // Channel for receiving async file operation results
     static PENDING_DOCUMENT: Mutex<Option<CanvasDocument>> = Mutex::new(None);
     static PENDING_LIBRARY: Mutex<Option<(String, CanvasDocument)>> = Mutex::new(None);
+    /// The document file last saved or opened, remembered for the next start.
+    static LAST_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+    pub fn last_path() -> Option<std::path::PathBuf> {
+        LAST_PATH.lock().ok().and_then(|p| p.clone())
+    }
+
+    pub fn set_last_path(path: std::path::PathBuf) {
+        if let Ok(mut last) = LAST_PATH.lock() {
+            *last = Some(path);
+        }
+    }
+
+    /// Read a saved document, named after its file.
+    pub fn read_document(path: &std::path::Path) -> Result<CanvasDocument, String> {
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let mut doc = CanvasDocument::from_json(&content).map_err(|e| e.to_string())?;
+        if let Some(stem) = path.file_stem() {
+            doc.name = stem.to_string_lossy().to_string();
+        }
+        Ok(doc)
+    }
     /// Wakes the event loop when a background file operation finishes, so its
     /// result shows without waiting for the next input event.
     static WAKER: Mutex<Option<winit::event_loop::EventLoopProxy<crate::tablet::UserEvent>>> =
@@ -80,6 +102,8 @@ pub mod file_ops {
                             log::error!("Failed to write file: {}", e);
                         } else {
                             log::info!("Saved document to: {:?}", path);
+                            set_last_path(path);
+                            wake();
                         }
                     }
                     Err(e) => log::error!("Failed to serialize document: {}", e),
@@ -117,6 +141,9 @@ pub mod file_ops {
                                 // Name it after the file, as it's shown in its tab.
                                 if let Some(stem) = path.file_stem() {
                                     doc.name = stem.to_string_lossy().to_string();
+                                }
+                                if !is_excalidraw {
+                                    set_last_path(path.clone());
                                 }
                                 if let Ok(mut pending) = PENDING_DOCUMENT.lock() {
                                     *pending = Some(doc);
@@ -1918,42 +1945,28 @@ impl App {
         }
     }
 
-    /// Run a keyboard (or tablet-mapped) command. Returns false if it
-    /// did nothing because the app isn't ready.
-    /// The quick toolbars hotkey (keyboard, pen or tablet button) was pressed
-    /// or released. A press opens the toolbars at the pointer (or closes them
-    /// if open). Releasing after a hold picks the item under the pointer and
-    /// closes them; after a short tap they stay open for a click.
-    pub(crate) fn quick_toolbars_key(&mut self, pressed: bool) {
+    /// Open the quick toolbars at the pointer, or close them if open.
+    pub(crate) fn toggle_quick_toolbars(&mut self) {
         let Some(state) = &mut self.state else {
             return;
         };
         let now = state.egui_ctx.input(|i| i.time);
-        if pressed {
-            state.ui_state.quick_bars = match state.ui_state.quick_bars {
-                Some(_) => None,
-                None => Some(crate::ui::QuickBars::new(now)),
-            };
-        } else if let Some(bars) = state.ui_state.quick_bars {
-            if now - bars.opened_at >= crate::ui::QuickBars::HOLD {
-                if let Some(item) = bars.hovered {
-                    state
-                        .queued_actions
-                        .push_back(QueuedAction::Ui(item.action()));
-                }
-                state.ui_state.quick_bars = None;
-            }
-        }
+        state.ui_state.quick_bars = match state.ui_state.quick_bars {
+            Some(_) => None,
+            None => Some(crate::ui::QuickBars::new(now)),
+        };
         state.needs_redraw = true;
         state.window.request_redraw();
     }
 
+    /// Run a keyboard (or tablet-mapped) command. Returns false if it
+    /// did nothing because the app isn't ready.
     fn run_command(&mut self, command: Command, egui_wants_input: bool) -> bool {
         let Some(state) = &mut self.state else {
             return false;
         };
         if command == Command::QuickToolbars {
-            self.quick_toolbars_key(true);
+            self.toggle_quick_toolbars();
             return true;
         }
         if command == Command::Cancel && state.ui_state.quick_bars.take().is_some() {
@@ -2509,6 +2522,26 @@ impl App {
             state.ui_state.writing_guides = preferences.writing_guides;
             state.canvas.tool_manager.brush = preferences.brush;
             state.canvas.tool_manager.nib_angle = preferences.nib_angle;
+            // Reopen the last document instead of the intro.
+            #[cfg(feature = "native")]
+            if let Some(path) = &preferences.last_document {
+                match file_ops::read_document(path) {
+                    Ok(doc) => {
+                        log::info!("Reopened {path:?}");
+                        state.tabs[0].name = doc.name.clone();
+                        state.canvas.document = doc;
+                        if let Some(bounds) = state.canvas.document.bounds() {
+                            state.canvas.camera.fit_to_bounds(
+                                bounds,
+                                state.canvas.viewport_size,
+                                50.0,
+                            );
+                        }
+                        file_ops::set_last_path(path.clone());
+                    }
+                    Err(e) => log::warn!("Couldn't reopen {path:?}: {e}"),
+                }
+            }
             state.saved_preferences = preferences;
         }
 
@@ -4423,6 +4456,10 @@ impl ApplicationHandler<UserEvent> for App {
                     writing_guides: state.ui_state.writing_guides,
                     brush: state.canvas.tool_manager.brush,
                     nib_angle: state.canvas.tool_manager.nib_angle,
+                    #[cfg(feature = "native")]
+                    last_document: file_ops::last_path(),
+                    #[cfg(not(feature = "native"))]
+                    last_document: None,
                 };
                 if preferences != state.saved_preferences {
                     preferences.save();
@@ -5375,34 +5412,24 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // The quick toolbars key acts on press and release (hold to
-                // pick), even with the pointer over the toolbars it opened.
-                if state.event_handler.editing_text.is_none() {
+                // The quick toolbars key toggles them even with the pointer
+                // over the toolbars it opened (unless typing in a text field).
+                if state.event_handler.editing_text.is_none()
+                    && event.state == ElementState::Pressed
+                    && !state.egui_ctx.wants_keyboard_input()
+                {
                     let chord = KeyChord::from_event(
                         &event,
                         state.input.ctrl(),
                         state.input.shift(),
                         state.input.alt(),
                     );
-                    let pressed = event.state == ElementState::Pressed;
-                    // Released keys match by key alone: modifiers may have
-                    // been let go first.
-                    let is_quick = chord.is_some_and(|chord| {
-                        if pressed {
-                            state.ui_state.keybindings.command_for(&chord)
-                                == Some(Command::QuickToolbars)
-                        } else {
-                            state
-                                .ui_state
-                                .keybindings
-                                .keys(Command::QuickToolbars)
-                                .iter()
-                                .any(|k| k.key == chord.key)
-                        }
-                    });
-                    if is_quick && !(pressed && state.egui_ctx.wants_keyboard_input()) {
+                    if chord.is_some_and(|chord| {
+                        state.ui_state.keybindings.command_for(&chord)
+                            == Some(Command::QuickToolbars)
+                    }) {
                         if !event.repeat {
-                            self.quick_toolbars_key(pressed);
+                            self.toggle_quick_toolbars();
                         }
                         return;
                     }

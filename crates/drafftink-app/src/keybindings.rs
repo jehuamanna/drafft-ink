@@ -15,8 +15,8 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Command {
     Tool(ToolKind),
-    /// Show the tools and colours next to the pointer. Tap to open (click
-    /// an item), or hold, move onto an item and release.
+    /// Show the tools, colours, widths and properties next to the pointer;
+    /// press again to hide them.
     QuickToolbars,
     // Edit
     Undo,

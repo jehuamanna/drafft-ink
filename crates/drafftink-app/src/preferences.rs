@@ -1,5 +1,5 @@
-//! Drawing preferences remembered between sessions: grid style, writing
-//! guide proportions and the pen brush. Saved to
+//! Preferences remembered between sessions: grid style, writing guide
+//! proportions, the pen brush and the last document. Saved to
 //! `~/.config/drafftink/preferences.json`.
 
 use drafftink_core::shapes::{Brush, DEFAULT_NIB_ANGLE};
@@ -13,6 +13,8 @@ pub struct Preferences {
     pub writing_guides: WritingGuides,
     pub brush: Brush,
     pub nib_angle: f64,
+    /// The document last saved or opened, reopened on start.
+    pub last_document: Option<std::path::PathBuf>,
 }
 
 impl Default for Preferences {
@@ -22,6 +24,7 @@ impl Default for Preferences {
             writing_guides: WritingGuides::default(),
             brush: Brush::default(),
             nib_angle: DEFAULT_NIB_ANGLE,
+            last_document: None,
         }
     }
 }
