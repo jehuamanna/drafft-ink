@@ -4214,6 +4214,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::Focused(focused) => state.extra.focused = focused,
+
             WindowEvent::CursorEntered { .. } => {
                 state.extra.pointer_in_window = true;
             }

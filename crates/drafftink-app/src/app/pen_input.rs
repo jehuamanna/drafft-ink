@@ -131,6 +131,26 @@ impl App {
             return;
         }
 
+        // Pad controls belong to the focused window. Dials read from the
+        // device arrive whatever window is focused, so drop them here; button
+        // releases still go through so held buttons don't stay held.
+        if !state.extra.focused {
+            match event {
+                TabletEvent::PadButton { pressed: true, .. }
+                | TabletEvent::Dial { .. }
+                | TabletEvent::EvdevDial { .. } => return,
+                TabletEvent::Ring { index, .. } => {
+                    self.pen.rings.remove(&index);
+                    return;
+                }
+                TabletEvent::Strip { index, .. } => {
+                    self.pen.strips.remove(&index);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         let active = state
             .ui_state
             .tablet_settings

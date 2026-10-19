@@ -24,6 +24,9 @@ use crate::ui::QueuedAction;
 pub(super) struct ExtraState {
     /// Whether the pointer is over the window (hides the brush outline).
     pub(super) pointer_in_window: bool,
+    /// Whether the window has keyboard focus; tablet pad controls are
+    /// ignored while it doesn't.
+    pub(super) focused: bool,
     /// Brush outline opacity; fades with pen hover height when enabled.
     pub(super) brush_cursor_opacity: f64,
     /// UI actions triggered by shortcuts or tablet controls, applied one per
@@ -47,6 +50,7 @@ impl Default for ExtraState {
     fn default() -> Self {
         Self {
             pointer_in_window: false,
+            focused: true,
             brush_cursor_opacity: 1.0,
             queued_actions: VecDeque::new(),
             saved_tablet_settings: TabletSettings::default(),
