@@ -33,9 +33,53 @@ Cross-platform (Linux, Windows, macOS, browser, mobile). Real-time collaboration
 
 ### Desktop
 
+Requires a [Rust toolchain](https://rustup.rs/).
+
+#### Linux (recommended)
+
 ```bash
 git clone https://github.com/PatWie/drafft-ink.git
 cd drafft-ink
+./install.sh
+```
+
+This builds a release binary, installs it to `~/.cargo/bin/drafftink`, and
+adds a desktop entry and icon under `~/.local/share`, so **DrafftInk appears in
+your application launcher** (GNOME, KDE, Walker, Rofi, Wofi, Fuzzel, etc.) with
+its icon in docks and taskbars. Search for "DrafftInk", "whiteboard" or "drawing".
+
+To update, `git pull` and run `./install.sh` again. To remove everything:
+
+```bash
+./install.sh --uninstall
+```
+
+<details>
+<summary>Manual install (what the script does)</summary>
+
+```bash
+cargo install --path crates/drafftink-app --locked
+install -Dm644 packaging/linux/drafftink.svg \
+    ~/.local/share/icons/hicolor/scalable/apps/drafftink.svg
+sed "s|^Exec=drafftink|Exec=$HOME/.cargo/bin/drafftink|" \
+    packaging/linux/drafftink.desktop > ~/.local/share/applications/drafftink.desktop
+update-desktop-database ~/.local/share/applications
+```
+
+The `Exec` path is made absolute because launchers often don't have
+`~/.cargo/bin` on their `PATH`.
+</details>
+
+Graphics tablets (e.g. Wacom) work natively on Wayland, including pen
+pressure, the eraser end, and the barrel buttons. **Menu → Pen Tablet...**
+configures the pressure curve, stabilizer, tilt/calligraphy, pen buttons,
+ExpressKeys, touch ring and pinch zoom. These settings apply while a Wacom
+tablet is connected, or to any tablet if you choose to force them, and are saved
+in `~/.config/drafftink/tablet.json`.
+
+#### Other platforms / run without installing
+
+```bash
 cargo run --release
 ```
 

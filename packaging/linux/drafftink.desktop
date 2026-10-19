@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=DrafftInk
+GenericName=Whiteboard
+Comment=Infinite canvas whiteboard with real-time collaboration
+Exec=drafftink
+Icon=drafftink
+Terminal=false
+Categories=Graphics;2DGraphics;VectorGraphics;
+Keywords=whiteboard;drawing;sketch;diagram;canvas;excalidraw;pen;tablet;
+StartupNotify=true
+StartupWMClass=drafftink

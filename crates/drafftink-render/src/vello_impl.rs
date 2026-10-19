@@ -713,94 +713,41 @@ impl VelloRenderer {
         freehand: &drafftink_core::shapes::Freehand,
         transform: Affine,
     ) {
-        use kurbo::Vec2;
-
-        if freehand.points.len() < 2 {
+        let n = freehand.points.len();
+        if n < 2 {
             return;
         }
 
         let style = &freehand.style;
-        let base_size = style.stroke_width * 2.3;
-        let thinning = 0.6;
-        let color = style.stroke_with_opacity();
+        let pressures: Vec<f64> = (0..n).map(|i| freehand.pressure_at(i)).collect();
 
-        // Build a filled polygon that represents the variable-width stroke
-        let mut left_points: Vec<Point> = Vec::new();
-        let mut right_points: Vec<Point> = Vec::new();
-        // Centre point and half width of the first and last outline samples,
-        // used to draw round caps.
-        let mut first_cap: Option<(Point, f64)> = None;
-        let mut last_cap: Option<(Point, f64)> = None;
-
-        // Input points can be far apart on fast strokes; interpolate a spline
-        // through them so curves don't render as facets.
-        let (points, pressures) = catmull_rom_resample(freehand, 1.5);
-
-        for i in 0..points.len() {
-            let point = points[i];
-            let pressure = pressures[i];
-            // Apply easing: sin((pressure * π) / 2)
-            let eased_pressure = (pressure * std::f64::consts::PI / 2.0).sin();
-            // Apply thinning: size * (1 - thinning * (1 - pressure))
-            let width = base_size * (1.0 - thinning * (1.0 - eased_pressure));
-
-            // Calculate perpendicular direction
-            let dir = if i == 0 {
-                // First point: use direction to next point
-                let next = points[i + 1];
-                Vec2::new(next.x - point.x, next.y - point.y)
-            } else if i == points.len() - 1 {
-                // Last point: use direction from previous point
-                let prev = points[i - 1];
-                Vec2::new(point.x - prev.x, point.y - prev.y)
-            } else {
-                // Middle points: average of incoming and outgoing directions
-                let prev = points[i - 1];
-                let next = points[i + 1];
-                Vec2::new(next.x - prev.x, next.y - prev.y)
-            };
-
-            let len = dir.hypot();
-            if len < f64::EPSILON {
-                continue;
-            }
-
-            // Perpendicular unit vector
-            let perp = Vec2::new(-dir.y / len, dir.x / len);
-            let half_width = width / 2.0;
-
-            left_points.push(Point::new(
-                point.x + perp.x * half_width,
-                point.y + perp.y * half_width,
-            ));
-            right_points.push(Point::new(
-                point.x - perp.x * half_width,
-                point.y - perp.y * half_width,
-            ));
-            first_cap.get_or_insert((point, half_width));
-            last_cap = Some((point, half_width));
+        // A single outline pinches or notches at sharp turns (v, n, w), so
+        // draw each section between them as its own round-capped piece. All
+        // pieces wind the same way, so the non-zero fill unions them without
+        // double-blending translucent strokes.
+        let reach = (style.stroke_width * 2.3).max(4.0);
+        let mut path = BezPath::new();
+        let mut start = 0;
+        for end in sharp_corners(&freehand.points, reach)
+            .into_iter()
+            .chain([n - 1])
+        {
+            // Input points can be far apart on fast strokes; interpolate a
+            // spline through them so curves don't render as facets.
+            let (points, pressures) =
+                catmull_rom_resample(&freehand.points[start..=end], &pressures[start..=end], 1.5);
+            append_stroke_outline(&mut path, &points, &pressures, style.stroke_width);
+            start = end;
         }
 
-        let (Some(first_cap), Some(last_cap)) = (first_cap, last_cap) else {
-            return;
-        };
-
-        // Build the path: left side forward, round end cap, right side
-        // backward, round start cap. Sides are smoothed with quadratic curves
-        // through segment midpoints so sparse (simplified) points don't show
-        // as corners.
-        let mut path = BezPath::new();
-        path.move_to(left_points[0]);
-        append_smoothed(&mut path, &left_points);
-        append_round_cap(&mut path, last_cap, left_points[left_points.len() - 1]);
-        right_points.reverse();
-        append_smoothed(&mut path, &right_points);
-        append_round_cap(&mut path, first_cap, right_points[right_points.len() - 1]);
-        path.close_path();
-
         // Fill the path (no sloppiness - freehand is already hand-drawn)
-        self.scene
-            .fill(Fill::NonZero, transform, color, None, &path);
+        self.scene.fill(
+            Fill::NonZero,
+            transform,
+            style.stroke_with_opacity(),
+            None,
+            &path,
+        );
     }
 
     /// Render a text shape using Parley for proper text layout.
@@ -1714,6 +1661,11 @@ impl Renderer for VelloRenderer {
             self.render_eraser_cursor(pos, radius, camera_transform);
         }
 
+        // Draw brush outline
+        if let Some((pos, diameter, opacity)) = ctx.brush_cursor {
+            self.render_brush_cursor(pos, diameter, opacity, camera_transform);
+        }
+
         // Draw laser pointer
         if let Some((pos, ref trail)) = ctx.laser_pointer {
             self.render_laser_pointer(pos, trail, camera_transform);
@@ -2181,6 +2133,27 @@ impl VelloRenderer {
         );
     }
 
+    /// Render the brush outline: a thin dark ring with a light halo so it
+    /// stays visible on any background.
+    fn render_brush_cursor(&mut self, pos: Point, diameter: f64, opacity: f64, transform: Affine) {
+        let circle = kurbo::Circle::new(pos, (diameter / 2.0).max(1.0 / self.zoom));
+        let alpha = |a: f64| (a * opacity.clamp(0.0, 1.0) * 255.0) as u8;
+        self.scene.stroke(
+            &Stroke::new(3.0 / self.zoom),
+            transform,
+            Color::from_rgba8(255, 255, 255, alpha(0.7)),
+            None,
+            &circle,
+        );
+        self.scene.stroke(
+            &Stroke::new(1.0 / self.zoom),
+            transform,
+            Color::from_rgba8(40, 40, 40, alpha(0.8)),
+            None,
+            &circle,
+        );
+    }
+
     /// Render laser pointer with trail.
     fn render_laser_pointer(&mut self, pos: Point, trail: &[(Point, f64)], transform: Affine) {
         // Draw trail with fading effect
@@ -2567,23 +2540,103 @@ mod tests {
     }
 }
 
-/// Sample a Catmull-Rom spline through the freehand points (and linearly
-/// interpolated pressures) at most `step` apart.
-fn catmull_rom_resample(
-    freehand: &drafftink_core::shapes::Freehand,
-    step: f64,
-) -> (Vec<Point>, Vec<f64>) {
-    let pts = &freehand.points;
+/// Indices of sharp turns (over 90°) in a stroke. Directions are measured
+/// `reach` along the stroke on each side so sensor jitter doesn't count, and
+/// only the sharpest point of each turn is returned.
+fn sharp_corners(points: &[Point], reach: f64) -> Vec<usize> {
+    let mut corners = Vec::new();
+    // Sharpest point of the turn in progress: (index, cosine of turn angle).
+    let mut sharpest: Option<(usize, f64)> = None;
+    for i in 1..points.len().saturating_sub(1) {
+        let p = points[i];
+        let back = points[..i].iter().rev().find(|q| q.distance(p) >= reach);
+        let ahead = points[i + 1..].iter().find(|q| q.distance(p) >= reach);
+        let cos = match (back, ahead) {
+            (Some(&b), Some(&a)) => {
+                let (incoming, outgoing) = (p - b, a - p);
+                incoming.dot(outgoing) / (incoming.hypot() * outgoing.hypot())
+            }
+            _ => 1.0,
+        };
+        if cos < 0.0 {
+            if sharpest.is_none_or(|(_, c)| cos < c) {
+                sharpest = Some((i, cos));
+            }
+        } else if let Some((corner, _)) = sharpest.take() {
+            corners.push(corner);
+        }
+    }
+    corners.extend(sharpest.map(|(corner, _)| corner));
+    corners
+}
+
+/// Append the filled outline of a variable-width stroke through `points`:
+/// left side forward, round end cap, right side backward, round start cap.
+fn append_stroke_outline(
+    path: &mut BezPath,
+    points: &[Point],
+    pressures: &[f64],
+    stroke_width: f64,
+) {
+    use kurbo::Vec2;
+
+    let mut left_points: Vec<Point> = Vec::new();
+    let mut right_points: Vec<Point> = Vec::new();
+    // Centre point and half width of the first and last outline samples,
+    // used to draw round caps.
+    let mut first_cap: Option<(Point, f64)> = None;
+    let mut last_cap: Option<(Point, f64)> = None;
+
+    for i in 0..points.len() {
+        let point = points[i];
+        let half_width = drafftink_core::shapes::pressure_width(stroke_width, pressures[i]) / 2.0;
+
+        // Direction of travel: to the next point at the start, from the
+        // previous one at the end, and across both in between.
+        let prev = points[i.saturating_sub(1)];
+        let next = points[(i + 1).min(points.len() - 1)];
+        let dir = next - prev;
+        let len = dir.hypot();
+        if len < f64::EPSILON {
+            continue;
+        }
+
+        // Perpendicular unit vector
+        let perp = Vec2::new(-dir.y / len, dir.x / len);
+        left_points.push(point + perp * half_width);
+        right_points.push(point - perp * half_width);
+        first_cap.get_or_insert((point, half_width));
+        last_cap = Some((point, half_width));
+    }
+
+    let (Some(first_cap), Some(last_cap)) = (first_cap, last_cap) else {
+        return;
+    };
+
+    // Sides are smoothed with quadratic curves through segment midpoints so
+    // remaining unevenness doesn't show as corners.
+    path.move_to(left_points[0]);
+    append_smoothed(path, &left_points);
+    append_round_cap(path, last_cap, left_points[left_points.len() - 1]);
+    right_points.reverse();
+    append_smoothed(path, &right_points);
+    append_round_cap(path, first_cap, right_points[right_points.len() - 1]);
+    path.close_path();
+}
+
+/// Sample a Catmull-Rom spline through `pts` (and linearly interpolated
+/// pressures) at most `step` apart.
+fn catmull_rom_resample(pts: &[Point], pressure: &[f64], step: f64) -> (Vec<Point>, Vec<f64>) {
     let n = pts.len();
     let mut points = vec![pts[0]];
-    let mut pressures = vec![freehand.pressure_at(0)];
+    let mut pressures = vec![pressure[0]];
 
     for i in 0..n - 1 {
         let p0 = pts[i.saturating_sub(1)].to_vec2();
         let p1 = pts[i].to_vec2();
         let p2 = pts[i + 1].to_vec2();
         let p3 = pts[(i + 2).min(n - 1)].to_vec2();
-        let (w1, w2) = (freehand.pressure_at(i), freehand.pressure_at(i + 1));
+        let (w1, w2) = (pressure[i], pressure[i + 1]);
 
         let samples = ((p2 - p1).hypot() / step).ceil().max(1.0) as usize;
         for j in 1..=samples {

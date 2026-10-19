@@ -116,6 +116,9 @@ pub struct RenderContext<'a> {
     pub eraser_cursor: Option<(kurbo::Point, f64)>,
     /// Laser pointer position and trail.
     pub laser_pointer: Option<(kurbo::Point, Vec<(kurbo::Point, f64)>)>,
+    /// Brush outline while hovering with a drawing tool: centre and diameter
+    /// in world coordinates, and opacity (0.0-1.0).
+    pub brush_cursor: Option<(kurbo::Point, f64, f64)>,
 }
 
 impl<'a> RenderContext<'a> {
@@ -136,6 +139,7 @@ impl<'a> RenderContext<'a> {
             smart_guides: Vec::new(),
             eraser_cursor: None,
             laser_pointer: None,
+            brush_cursor: None,
         }
     }
 
@@ -196,6 +200,12 @@ impl<'a> RenderContext<'a> {
     /// Set eraser cursor position and radius.
     pub fn with_eraser_cursor(mut self, cursor: Option<(kurbo::Point, f64)>) -> Self {
         self.eraser_cursor = cursor;
+        self
+    }
+
+    /// Set the brush outline shown while hovering with a drawing tool.
+    pub fn with_brush_cursor(mut self, cursor: Option<(kurbo::Point, f64, f64)>) -> Self {
+        self.brush_cursor = cursor;
         self
     }
 

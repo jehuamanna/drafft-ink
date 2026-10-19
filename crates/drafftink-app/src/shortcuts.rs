@@ -63,6 +63,23 @@ impl ShortcutRegistry {
             Shortcut::new("Backspace", false, false, "Delete selected shapes"),
             Shortcut::new("Escape", false, false, "Cancel current action"),
             Shortcut::new(
+                "Alt+1-6",
+                false,
+                false,
+                "Stroke colour: Blue, Red, Emerald, Amber, Purple, Slate",
+            ),
+            Shortcut::new("[ / ]", false, false, "Previous / next stroke colour"),
+            Shortcut::new(
+                "Alt+7/8/9/0",
+                false,
+                false,
+                "Stroke width: Thin, Normal, Bold, Extra Bold",
+            ),
+            Shortcut::new("= / -", true, false, "Zoom in / out"),
+            Shortcut::new("0", true, false, "Reset zoom to 100%"),
+            Shortcut::new("1", false, true, "Zoom to fit selection or all"),
+            Shortcut::new("Home", false, false, "Center canvas"),
+            Shortcut::new(
                 "Space",
                 false,
                 false,

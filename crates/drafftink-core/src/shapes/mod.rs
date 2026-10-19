@@ -12,7 +12,7 @@ mod text;
 
 pub use arrow::Arrow;
 pub use ellipse::Ellipse;
-pub use freehand::Freehand;
+pub use freehand::{Freehand, pressure_width};
 pub use group::Group;
 pub use image::{Image, ImageFormat};
 pub use line::{Line, PathStyle};

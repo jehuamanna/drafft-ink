@@ -29,6 +29,7 @@ vello.workspace = true
 log.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 
 # UI
 egui.workspace = true
@@ -49,12 +50,13 @@ png.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 egui-winit = { workspace = true, features = ["clipboard", "links", "x11", "wayland"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+dirs = "5"
 
 # Wayland graphics-tablet (stylus) input; winit doesn't support it
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
-wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # No clipboard/native features for WASM

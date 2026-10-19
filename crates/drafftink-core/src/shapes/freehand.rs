@@ -116,6 +116,18 @@ impl Freehand {
     }
 }
 
+/// Width of a pressure-sensitive freehand stroke at `pressure` (0.0-1.0).
+///
+/// Full pressure (and mouse input) gives `stroke_width * 2.3`; a light touch
+/// thins down to 15% of that, so pressure is clearly visible like real ink.
+pub fn pressure_width(stroke_width: f64, pressure: f64) -> f64 {
+    const MIN_FRACTION: f64 = 0.15;
+    // Slightly below 1 so normal writing pressure isn't too thin.
+    const GAMMA: f64 = 0.8;
+    let p = pressure.clamp(0.0, 1.0).powf(GAMMA);
+    stroke_width * 2.3 * (MIN_FRACTION + (1.0 - MIN_FRACTION) * p)
+}
+
 impl Default for Freehand {
     fn default() -> Self {
         Self::new()

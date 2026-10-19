@@ -21,14 +21,20 @@ use vello::{AaConfig, RenderParams, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 #[cfg(not(target_arch = "wasm32"))]
 use winit::dpi::LogicalSize;
-use winit::event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::event_handler::EventHandler;
-use crate::tablet::{TabletEvent, UserEvent};
-use crate::ui::{SelectedShapeProps, UiAction, UiState, render_ui};
+use crate::tablet::UserEvent;
+use crate::tablet_settings::TabletSettings;
+use crate::ui::{
+    QueuedAction, SelectedShapeProps, UiAction, UiState, render_ui, resolve_queued_action,
+    shortcut_action,
+};
+
+mod pen_input;
 
 #[cfg(feature = "native")]
 pub mod file_ops {
@@ -1573,6 +1579,15 @@ struct AppState {
 
     // Text editing state (when editing a text shape)
     text_edit_state: Option<TextEditState>,
+    /// Whether the pointer is over the window (hides the brush outline).
+    pointer_in_window: bool,
+    /// Brush outline opacity; fades with pen hover height when enabled.
+    brush_cursor_opacity: f64,
+    /// UI actions triggered by shortcuts or tablet controls, applied one per
+    /// UI pass.
+    queued_actions: std::collections::VecDeque<QueuedAction>,
+    /// Tablet settings as last saved, to save again when they change.
+    saved_tablet_settings: TabletSettings,
 
     // Collaboration
     collab: CollaborationManager,
@@ -1781,12 +1796,8 @@ pub struct App {
     startup_room: Option<String>,
     /// Handed to the tablet listener once the display connection exists.
     tablet_proxy: Option<EventLoopProxy<UserEvent>>,
-    /// Latest stylus pressure (0.0-1.0) reported by the tablet.
-    stylus_pressure: f64,
-    /// Whether the stylus tip is currently touching the tablet.
-    stylus_down: bool,
-    /// Tool to restore when the pen is flipped back from its eraser end.
-    tool_before_eraser: Option<ToolKind>,
+    /// Pen tablet input state.
+    pen: pen_input::PenInput,
 }
 
 impl App {
@@ -1807,9 +1818,7 @@ impl App {
             startup_server: None,
             startup_room: None,
             tablet_proxy: None,
-            stylus_pressure: 1.0,
-            stylus_down: false,
-            tool_before_eraser: None,
+            pen: pen_input::PenInput::default(),
         }
     }
 
@@ -1837,90 +1846,6 @@ impl App {
         }
     }
 
-    /// Translate stylus input into the equivalent mouse events, carrying the
-    /// pen pressure to freehand tools via the tool manager.
-    fn handle_tablet_event(&mut self, event_loop: &ActiveEventLoop, event: TabletEvent) {
-        let Some(state) = &mut self.state else {
-            return;
-        };
-        let window_id = state.window.id();
-        let scale = state.window.scale_factor();
-        let device_id = DeviceId::dummy();
-
-        let button_event = |button, pressed: bool| WindowEvent::MouseInput {
-            device_id,
-            state: if pressed {
-                ElementState::Pressed
-            } else {
-                ElementState::Released
-            },
-            button,
-        };
-
-        let window_event = match event {
-            TabletEvent::ProximityIn { eraser } => {
-                // The pen's eraser end selects the eraser; the tip restores the
-                // previous tool unless the user picked another one meanwhile.
-                let current = state.canvas.tool_manager.current_tool;
-                if eraser {
-                    if current != ToolKind::Eraser {
-                        self.tool_before_eraser = Some(current);
-                        state.canvas.set_tool(ToolKind::Eraser);
-                    }
-                } else if let Some(previous) = self.tool_before_eraser.take() {
-                    if current == ToolKind::Eraser {
-                        state.canvas.set_tool(previous);
-                    }
-                }
-                state.needs_redraw = true;
-                state.window.request_redraw();
-                return;
-            }
-            TabletEvent::Motion { x, y, pressure } => {
-                self.stylus_pressure = pressure;
-                if self.stylus_down {
-                    state.canvas.tool_manager.stylus_pressure = Some(pressure);
-                }
-                WindowEvent::CursorMoved {
-                    device_id,
-                    position: winit::dpi::PhysicalPosition::new(x * scale, y * scale),
-                }
-            }
-            TabletEvent::Down => {
-                self.stylus_down = true;
-                state.canvas.tool_manager.stylus_pressure = Some(self.stylus_pressure);
-                button_event(MouseButton::Left, true)
-            }
-            TabletEvent::Up => {
-                self.stylus_down = false;
-                let event = button_event(MouseButton::Left, false);
-                self.window_event(event_loop, window_id, event);
-                if let Some(state) = &mut self.state {
-                    state.canvas.tool_manager.stylus_pressure = None;
-                }
-                return;
-            }
-            TabletEvent::Button { secondary, pressed } => {
-                // Lower barrel button pans like the middle mouse button.
-                let button = if secondary {
-                    MouseButton::Middle
-                } else {
-                    MouseButton::Right
-                };
-                button_event(button, pressed)
-            }
-            TabletEvent::ProximityOut => {
-                if !self.stylus_down {
-                    return;
-                }
-                self.stylus_down = false;
-                state.canvas.tool_manager.stylus_pressure = None;
-                button_event(MouseButton::Left, false)
-            }
-        };
-        self.window_event(event_loop, window_id, window_event);
-    }
-
     /// Finish initialization after surface is created.
     fn finish_init(&mut self, window: Arc<Window>, surface: RenderSurface<'static>) {
         let render_cx = self
@@ -1939,6 +1864,8 @@ impl App {
 
         // Initialize egui
         let egui_ctx = egui::Context::default();
+        // Ctrl +/-/0 zoom the canvas; don't let egui scale the UI too.
+        egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -1995,6 +1922,10 @@ impl App {
             config: self.config.clone(),
             event_handler: EventHandler::new(),
             text_edit_state: None,
+            queued_actions: std::collections::VecDeque::new(),
+            saved_tablet_settings: TabletSettings::default(),
+            pointer_in_window: false,
+            brush_cursor_opacity: 1.0,
             collab: CollaborationManager::new(),
             websocket: None,
             remote_peers: std::collections::HashMap::new(),
@@ -2004,6 +1935,12 @@ impl App {
             last_doc_version: 0,
             needs_redraw: true,
         });
+
+        if let Some(state) = &mut self.state {
+            let settings = TabletSettings::load();
+            state.ui_state.tablet_settings = settings.clone();
+            state.saved_tablet_settings = settings;
+        }
 
         self.pending_window = None;
 
@@ -2162,6 +2099,16 @@ impl ApplicationHandler<UserEvent> for App {
         let window_attrs = Window::default_attributes()
             .with_title(&self.config.title)
             .with_inner_size(LogicalSize::new(self.config.width, self.config.height));
+
+        // Wayland app id / X11 WM_CLASS (one shared setting in winit) matching
+        // drafftink.desktop, so launchers and taskbars associate the window
+        // with its desktop entry and icon.
+        #[cfg(target_os = "linux")]
+        let window_attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+            window_attrs,
+            "drafftink",
+            "drafftink",
+        );
 
         // On WASM, attach canvas to DOM and use full viewport
         #[cfg(target_arch = "wasm32")]
@@ -2709,7 +2656,12 @@ impl ApplicationHandler<UserEvent> for App {
                 let mut tab_action: Option<UiAction> = None;
                 let mut ui_action_taken = false;
                 let egui_output = state.egui_ctx.run(egui_input, |ctx| {
-                    if let Some(action) = render_ui(ctx, &mut state.ui_state, &selected_props) {
+                    if let Some(action) = render_ui(ctx, &mut state.ui_state, &selected_props)
+                        .or_else(|| {
+                            let queued = state.queued_actions.pop_front()?;
+                            Some(resolve_queued_action(queued, &state.ui_state))
+                        })
+                    {
                         ui_action_taken = true;
                         match action.clone() {
                             UiAction::SetTool(tool) => {
@@ -3793,6 +3745,16 @@ impl ApplicationHandler<UserEvent> for App {
                 }
 
                 // Handle deferred actions that need render_cx access
+                // Persist tablet settings edited in the settings window, and
+                // keep applying queued actions (one per UI pass).
+                if state.ui_state.tablet_settings != state.saved_tablet_settings {
+                    state.ui_state.tablet_settings.save();
+                    state.saved_tablet_settings = state.ui_state.tablet_settings.clone();
+                }
+                if !state.queued_actions.is_empty() {
+                    state.window.request_redraw();
+                }
+
                 if let Some(action) = deferred_action {
                     if let Some(render_cx) = self.render_cx.as_ref() {
                         let device_handle = &render_cx.devices[state.surface.dev_id];
@@ -3979,6 +3941,34 @@ impl ApplicationHandler<UserEvent> for App {
                     None
                 };
 
+                // Brush outline at full-pressure width while hovering with a
+                // drawing tool over the canvas
+                let brush_cursor = {
+                    let tool = state.canvas.tool_manager.current_tool;
+                    let drawing_tool = matches!(tool, ToolKind::Freehand | ToolKind::Highlighter);
+                    if drawing_tool
+                        && !state.canvas.tool_manager.is_active()
+                        && !state.egui_ctx.is_pointer_over_area()
+                        && state.pointer_in_window
+                    {
+                        let mut stroke_width = state.ui_state.stroke_width as f64;
+                        if tool == ToolKind::Highlighter {
+                            stroke_width = stroke_width.max(12.0);
+                        }
+                        let world = state
+                            .canvas
+                            .camera
+                            .screen_to_world(state.input.mouse_position());
+                        Some((
+                            world,
+                            drafftink_core::shapes::pressure_width(stroke_width, 1.0),
+                            state.brush_cursor_opacity,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+
                 // Get laser pointer info
                 let laser_pointer =
                     if state.canvas.tool_manager.current_tool == ToolKind::LaserPointer {
@@ -4003,6 +3993,7 @@ impl ApplicationHandler<UserEvent> for App {
                     .with_rotation_info(rotation_info)
                     .with_smart_guides(smart_guides)
                     .with_eraser_cursor(eraser_cursor)
+                    .with_brush_cursor(brush_cursor)
                     .with_laser_pointer(laser_pointer);
 
                 state.shape_renderer.build_scene(&render_ctx);
@@ -4212,7 +4203,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
+            WindowEvent::CursorEntered { .. } => {
+                state.pointer_in_window = true;
+            }
+
+            WindowEvent::CursorLeft { .. } => {
+                state.pointer_in_window = false;
+                state.needs_redraw = true;
+                state.window.request_redraw();
+            }
+
             WindowEvent::CursorMoved { position, .. } => {
+                state.pointer_in_window = true;
                 let point = Point::new(position.x, position.y);
 
                 // Skip canvas processing if egui wants the pointer
@@ -4872,6 +4874,7 @@ impl ApplicationHandler<UserEvent> for App {
                         NamedKey::ArrowDown => "ArrowDown",
                         NamedKey::ArrowLeft => "ArrowLeft",
                         NamedKey::ArrowRight => "ArrowRight",
+                        NamedKey::Home => "Home",
                         _ => return,
                     },
                     Key::Character(c) => c.as_str(),
@@ -4880,6 +4883,39 @@ impl ApplicationHandler<UserEvent> for App {
 
                 match event.state {
                     ElementState::Pressed => {
+                        // Zoom, colour and width shortcuts go through the same
+                        // path as clicking the corresponding UI control.
+                        let digit = match event.physical_key {
+                            PhysicalKey::Code(code) => [
+                                KeyCode::Digit0,
+                                KeyCode::Digit1,
+                                KeyCode::Digit2,
+                                KeyCode::Digit3,
+                                KeyCode::Digit4,
+                                KeyCode::Digit5,
+                                KeyCode::Digit6,
+                                KeyCode::Digit7,
+                                KeyCode::Digit8,
+                                KeyCode::Digit9,
+                            ]
+                            .iter()
+                            .position(|&d| d == code)
+                            .map(|n| n as u8),
+                            _ => None,
+                        };
+                        if let Some(action) = shortcut_action(
+                            key_str,
+                            digit,
+                            state.input.ctrl(),
+                            state.input.shift(),
+                            state.input.alt(),
+                            &state.ui_state,
+                        ) {
+                            state.queued_actions.push_back(QueuedAction::Ui(action));
+                            state.window.request_redraw();
+                            return;
+                        }
+
                         // Check for Ctrl/Cmd modifiers first for file operations
                         let has_modifier = state.input.ctrl();
 
@@ -5584,6 +5620,15 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Tablet(event) => self.handle_tablet_event(event_loop, event),
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Tear down GPU and clipboard state while the display connection is
+        // still alive; winit closes it before `App` itself is dropped, and
+        // EGL/clipboard cleanup touching the closed connection segfaults.
+        self.state = None;
+        self.pending_window = None;
+        self.render_cx = None;
     }
 
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: winit::event::StartCause) {

@@ -11,6 +11,10 @@ use egui::{
 
 #[cfg(target_arch = "wasm32")]
 use crate::app::file_ops;
+use crate::tablet::{Devices, PenInfo};
+use crate::tablet_settings::{
+    Activation, ButtonAction, NibAngle, RingAction, TabletSettings, WACOM_VENDOR_ID,
+};
 
 // Re-export from widgets crate for consistent styling
 use drafftink_widgets::{
@@ -195,10 +199,10 @@ impl SelectedShapeProps {
 // Tailwind colors are now imported from drafftink_widgets
 
 const STROKE_WIDTHS: &[(f32, &str)] = &[
-    (1.0, "Thin"),
-    (2.0, "Normal"),
-    (4.0, "Bold"),
-    (8.0, "Extra Bold"),
+    (1.0, "Thin (Alt+7)"),
+    (2.0, "Normal (Alt+8)"),
+    (4.0, "Bold (Alt+9)"),
+    (8.0, "Extra Bold (Alt+0)"),
 ];
 
 /// Which color popover is open
@@ -282,6 +286,18 @@ pub struct UiState {
     pub collab_modal_open: bool,
     /// Whether the keyboard shortcuts modal is open.
     pub shortcuts_modal_open: bool,
+    /// Whether the pen tablet settings window is open.
+    pub tablet_settings_open: bool,
+    /// Pen tablet settings (loaded and saved by the app).
+    pub tablet_settings: TabletSettings,
+    /// Connected tablets and pads.
+    pub tablet_devices: Devices,
+    /// Whether the tablet settings currently apply.
+    pub tablet_active: bool,
+    /// The pen last seen near the tablet.
+    pub tablet_pen: Option<PenInfo>,
+    /// Last pressed tablet button, to help identify ExpressKeys.
+    pub tablet_last_pad_button: Option<u32>,
     /// Whether the save dialog is open.
     pub save_dialog_open: bool,
     /// Whether the open dialog is open.
@@ -340,6 +356,12 @@ impl Default for UiState {
             bg_color: Color32::WHITE,
             collab_modal_open: false,
             shortcuts_modal_open: false,
+            tablet_settings_open: false,
+            tablet_settings: TabletSettings::default(),
+            tablet_devices: Devices::default(),
+            tablet_active: false,
+            tablet_pen: None,
+            tablet_last_pad_button: None,
             save_dialog_open: false,
             open_dialog_open: false,
             open_recent_dialog_open: false,
@@ -865,7 +887,7 @@ fn render_bottom_toolbar(ctx: &Context, ui_state: &mut UiState) -> Option<UiActi
                         if minus_response.clicked() {
                             action = Some(UiAction::ZoomOut);
                         }
-                        minus_response.clone().on_hover_text("Zoom out");
+                        minus_response.clone().on_hover_text("Zoom out (Ctrl+-)");
                         minus_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
                         ui.add_space(12.0);
@@ -886,7 +908,9 @@ fn render_bottom_toolbar(ctx: &Context, ui_state: &mut UiState) -> Option<UiActi
                         if zoom_response.clicked() {
                             action = Some(UiAction::ZoomReset);
                         }
-                        zoom_response.clone().on_hover_text("Reset to 100%");
+                        zoom_response
+                            .clone()
+                            .on_hover_text("Reset to 100% (Ctrl+0)");
                         zoom_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
                         ui.add_space(12.0);
@@ -899,7 +923,7 @@ fn render_bottom_toolbar(ctx: &Context, ui_state: &mut UiState) -> Option<UiActi
                         if plus_response.clicked() {
                             action = Some(UiAction::ZoomIn);
                         }
-                        plus_response.clone().on_hover_text("Zoom in");
+                        plus_response.clone().on_hover_text("Zoom in (Ctrl+=)");
                         plus_response.on_hover_cursor(egui::CursorIcon::PointingHand);
 
                         ui.add_space(8.0);
@@ -907,7 +931,7 @@ fn render_bottom_toolbar(ctx: &Context, ui_state: &mut UiState) -> Option<UiActi
                         // Center button - circle with dot icon
                         if IconButton::new(
                             include_image!("../assets/center.svg"),
-                            "Center canvas at origin",
+                            "Center canvas at origin (Home)",
                         )
                         .small()
                         .show(ui)
@@ -919,9 +943,9 @@ fn render_bottom_toolbar(ctx: &Context, ui_state: &mut UiState) -> Option<UiActi
 
                         // Zoom to fit button
                         let fit_tooltip = if ui_state.selection_count > 0 {
-                            "Zoom to fit selection"
+                            "Zoom to fit selection (Shift+1)"
                         } else {
-                            "Zoom to fit all elements"
+                            "Zoom to fit all elements (Shift+1)"
                         };
                         if IconButton::new(include_image!("../assets/zoom-fit.svg"), fit_tooltip)
                             .small()
@@ -1016,6 +1040,103 @@ fn render_bottom_toolbar(ctx: &Context, ui_state: &mut UiState) -> Option<UiActi
 // Using 500-level for strokes (index 5), 100-level for fills (index 1)
 const QUICK_COLORS: &[usize] = &[10, 0, 6, 2, 13, 17]; // Blue, Red, Emerald, Amber, Purple, Slate
 
+/// UI action for a keyboard shortcut, if `key` is one. `digit` is the number
+/// key pressed (by physical position, so Shift/Alt don't change it).
+///
+/// - Ctrl+`=`/`+`, Ctrl+`-`, Ctrl+0: zoom in, out, reset to 100%
+/// - Shift+1: zoom to fit (selection, or everything); Home: center canvas
+/// - Alt+1-6: quick stroke colours; Alt+7/8/9/0: stroke widths
+/// - `[` / `]`: previous/next stroke colour in the palette
+pub fn shortcut_action(
+    key: &str,
+    digit: Option<u8>,
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    ui_state: &UiState,
+) -> Option<UiAction> {
+    if ctrl {
+        return match key {
+            "=" | "+" => Some(UiAction::ZoomIn),
+            "-" => Some(UiAction::ZoomOut),
+            _ if digit == Some(0) => Some(UiAction::ZoomReset),
+            _ => None,
+        };
+    }
+    if alt {
+        return match digit? {
+            n @ 1..=6 => Some(UiAction::SetStrokeColor(
+                TAILWIND_COLORS[QUICK_COLORS[n as usize - 1]].shades[6],
+            )),
+            n @ (7..=9 | 0) => Some(UiAction::SetStrokeWidth(
+                STROKE_WIDTHS[(n as usize + 3) % 10].0,
+            )),
+            _ => None,
+        };
+    }
+    match key {
+        _ if shift && digit == Some(1) => Some(UiAction::ZoomToFit),
+        "Home" => Some(UiAction::CenterCanvas),
+        "[" => Some(UiAction::SetStrokeColor(cycle_stroke_color(
+            ui_state.stroke_color,
+            -1,
+        ))),
+        "]" => Some(UiAction::SetStrokeColor(cycle_stroke_color(
+            ui_state.stroke_color,
+            1,
+        ))),
+        _ => None,
+    }
+}
+
+/// An action queued for the next UI pass. Relative changes are resolved
+/// against the current state when applied, so several in a row add up.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueuedAction {
+    Ui(UiAction),
+    /// Step through the stroke colour palette.
+    CycleColor(isize),
+    /// Step through the stroke widths.
+    StepWidth(isize),
+}
+
+/// Turn a queued action into a concrete UI action.
+pub fn resolve_queued_action(action: QueuedAction, ui_state: &UiState) -> UiAction {
+    match action {
+        QueuedAction::Ui(action) => action,
+        QueuedAction::CycleColor(step) => {
+            UiAction::SetStrokeColor(cycle_stroke_color(ui_state.stroke_color, step))
+        }
+        QueuedAction::StepWidth(step) => {
+            // Nearest preset to the current width, then step and clamp.
+            let current = STROKE_WIDTHS
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let da = (a.0 - ui_state.stroke_width).abs();
+                    let db = (b.0 - ui_state.stroke_width).abs();
+                    da.total_cmp(&db)
+                })
+                .map_or(0, |(i, _)| i);
+            let next = (current as isize + step).clamp(0, STROKE_WIDTHS.len() as isize - 1);
+            UiAction::SetStrokeWidth(STROKE_WIDTHS[next as usize].0)
+        }
+    }
+}
+
+/// The palette colour `step` places from `current` (500 level, as the swatches
+/// use), wrapping around. A custom colour starts from either end.
+fn cycle_stroke_color(current: Color32, step: isize) -> Color32 {
+    let shade = |family: usize| TAILWIND_COLORS[family].shades[6];
+    let len = TAILWIND_COLORS.len() as isize;
+    let next = match (0..TAILWIND_COLORS.len()).find(|&i| shade(i) == current) {
+        Some(i) => (i as isize + step).rem_euclid(len),
+        None if step > 0 => 0,
+        None => len - 1,
+    };
+    shade(next as usize)
+}
+
 /// Render the properties panel at the top.
 fn render_properties_panel(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
     let mut action = None;
@@ -1039,15 +1160,12 @@ fn render_properties_panel(ctx: &Context, ui_state: &mut UiState) -> Option<UiAc
                             ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
 
                             // Quick colors (500-level for strokes)
-                            for &idx in QUICK_COLORS {
+                            for (i, &idx) in QUICK_COLORS.iter().enumerate() {
                                 let color = TAILWIND_COLORS[idx].shades[6]; // 500-level
                                 let is_selected = ui_state.stroke_color == color;
-                                if color_swatch_selectable(
-                                    ui,
-                                    color,
-                                    TAILWIND_COLORS[idx].name,
-                                    is_selected,
-                                ) {
+                                let tooltip =
+                                    format!("{} (Alt+{})", TAILWIND_COLORS[idx].name, i + 1);
+                                if color_swatch_selectable(ui, color, &tooltip, is_selected) {
                                     action = Some(UiAction::SetStrokeColor(color));
                                     ui_state.color_popover = ColorPopover::None;
                                 }
@@ -1067,8 +1185,11 @@ fn render_properties_panel(ctx: &Context, ui_state: &mut UiState) -> Option<UiAc
                             }
 
                             // Color wheel (opens full picker)
-                            let (clicked, rect) =
-                                color_swatch_current(ui, ui_state.stroke_color, "Pick color");
+                            let (clicked, rect) = color_swatch_current(
+                                ui,
+                                ui_state.stroke_color,
+                                "Pick color ([ / ] to cycle)",
+                            );
                             stroke_current_rect = rect;
                             if clicked {
                                 ui_state.color_popover =
@@ -1995,6 +2116,11 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
 
                         widgets_menu_separator(ui);
 
+                        if menu_item(ui, "Pen Tablet...", "") {
+                            ui_state.tablet_settings_open = true;
+                            ui_state.menu_open = false;
+                        }
+
                         if menu_item(ui, "Keyboard Shortcuts", "?") {
                             action = Some(UiAction::ShowShortcuts);
                             ui_state.menu_open = false;
@@ -2031,6 +2157,10 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
     // Render shortcuts modal if open
     if ui_state.shortcuts_modal_open {
         render_shortcuts_modal(ctx, ui_state);
+    }
+
+    if ui_state.tablet_settings_open {
+        render_tablet_settings(ctx, ui_state);
     }
 
     // Render save dialog if open
@@ -3029,4 +3159,368 @@ fn render_math_editor(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction>
     }
 
     action
+}
+
+/// Pen tablet settings window.
+fn render_tablet_settings(ctx: &Context, ui_state: &mut UiState) {
+    let mut open = true;
+    egui::Window::new("Pen Tablet")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(420.0)
+        .default_height(560.0)
+        .vscroll(true)
+        .show(ctx, |ui| {
+            tablet_status(ui, ui_state);
+            ui.separator();
+
+            let detected_modes = ui_state
+                .tablet_devices
+                .pads
+                .iter()
+                .map(|p| p.modes)
+                .max()
+                .unwrap_or(0);
+            let detected_buttons = ui_state
+                .tablet_devices
+                .pads
+                .iter()
+                .map(|p| p.buttons)
+                .max()
+                .unwrap_or(0);
+            let has_strips = ui_state.tablet_devices.pads.iter().any(|p| p.strips > 0);
+            let last_pad_button = ui_state.tablet_last_pad_button;
+            let s = &mut ui_state.tablet_settings;
+
+            ui.label(egui::RichText::new("Use these settings").strong());
+            ui.radio_value(
+                &mut s.activation,
+                Activation::WacomOnly,
+                "When a Wacom tablet is connected",
+            );
+            ui.radio_value(
+                &mut s.activation,
+                Activation::AnyTablet,
+                "For any tablet (force)",
+            );
+            ui.radio_value(&mut s.activation, Activation::Off, "Never (plain pen)");
+
+            egui::CollapsingHeader::new("Pressure")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut s.pressure_curve, 0.3..=3.0)
+                            .logarithmic(true)
+                            .text("Curve (soft ← → firm)"),
+                    );
+                    ui.add(egui::Slider::new(&mut s.pressure_min, 0.0..=0.5).text("Ignore below"));
+                    ui.add(egui::Slider::new(&mut s.pressure_max, 0.3..=1.0).text("Full at"));
+                    ui.add(
+                        egui::Slider::new(&mut s.pressure_smoothing, 0.0..=0.9).text("Smoothing"),
+                    );
+                    pressure_curve_plot(ui, s);
+                });
+
+            egui::CollapsingHeader::new("Stabilizer")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.checkbox(&mut s.stabilizer, "Steady slow strokes");
+                    ui.add_enabled_ui(s.stabilizer, |ui| {
+                        ui.add(
+                            egui::Slider::new(&mut s.stabilizer_min_cutoff, 0.5..=30.0)
+                                .logarithmic(true)
+                                .text("Responsiveness at rest (Hz)"),
+                        )
+                        .on_hover_text("Lower is steadier, higher follows the pen more closely");
+                        ui.add(
+                            egui::Slider::new(&mut s.stabilizer_speed, 0.0..=0.2)
+                                .text("Speed boost"),
+                        )
+                        .on_hover_text(
+                            "How quickly smoothing backs off as the pen moves faster (less lag)",
+                        );
+                    });
+                });
+
+            egui::CollapsingHeader::new("Tilt and calligraphy").show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut s.tilt_width, 0.0..=1.0).text("Tilt widens stroke"));
+                ui.checkbox(&mut s.calligraphy, "Calligraphy nib");
+                ui.add_enabled_ui(s.calligraphy, |ui| {
+                    egui::ComboBox::from_label("Nib angle from")
+                        .selected_text(s.nib_angle_source.label())
+                        .show_ui(ui, |ui| {
+                            for source in NibAngle::ALL {
+                                ui.selectable_value(
+                                    &mut s.nib_angle_source,
+                                    source,
+                                    source.label(),
+                                );
+                            }
+                        });
+                    ui.add(
+                        egui::Slider::new(&mut s.nib_angle, -90.0..=90.0)
+                            .text("Fixed nib angle (°)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut s.nib_thinness, 0.05..=1.0).text("Thin edge width"),
+                    );
+                });
+            });
+
+            egui::CollapsingHeader::new("Eraser and hover").show(ui, |ui| {
+                ui.checkbox(
+                    &mut s.eraser_end_switches_tool,
+                    "Eraser end switches to the eraser",
+                );
+                ui.add(
+                    egui::Slider::new(&mut s.eraser_pressure, 0.0..=1.0)
+                        .text("Pressure sets eraser size"),
+                );
+                ui.checkbox(&mut s.hover_fade, "Fade brush outline with hover height");
+                ui.checkbox(
+                    &mut s.remember_tool_per_pen,
+                    "Each pen remembers its tool (by serial)",
+                );
+            });
+
+            egui::CollapsingHeader::new("Pen buttons")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (i, name) in [
+                        "Button 1 (BTN_STYLUS)",
+                        "Button 2 (BTN_STYLUS2)",
+                        "Button 3 (BTN_STYLUS3)",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        button_action_combo(ui, name, &mut s.stylus_buttons[i]);
+                    }
+                });
+
+            egui::CollapsingHeader::new("ExpressKeys").show(ui, |ui| {
+                match last_pad_button {
+                    Some(n) => ui.label(format!("Last pressed: key {}", n + 1)),
+                    None => ui.label("Press a key on the tablet to see its number."),
+                };
+                let count = (detected_buttons as usize).max(s.pad_buttons.len());
+                s.pad_buttons.resize(count, ButtonAction::None);
+                for (i, action) in s.pad_buttons.iter_mut().enumerate() {
+                    button_action_combo(ui, &format!("Key {}", i + 1), action);
+                }
+            });
+
+            egui::CollapsingHeader::new("Touch ring, strip and gestures").show(ui, |ui| {
+                ui.label("Ring action for each mode (switch modes with the ring's centre button):");
+                let modes = (detected_modes as usize).max(s.ring_modes.len()).max(1);
+                s.ring_modes.resize(modes, RingAction::None);
+                for (i, action) in s.ring_modes.iter_mut().enumerate() {
+                    ring_action_combo(ui, &format!("Ring mode {}", i + 1), action);
+                }
+                if has_strips || !s.strip_modes.is_empty() {
+                    let modes = (detected_modes as usize).max(s.strip_modes.len()).max(1);
+                    s.strip_modes.resize(modes, RingAction::None);
+                    for (i, action) in s.strip_modes.iter_mut().enumerate() {
+                        ring_action_combo(ui, &format!("Strip mode {}", i + 1), action);
+                    }
+                }
+                ui.add(
+                    egui::Slider::new(&mut s.ring_step_degrees, 5.0..=90.0)
+                        .text("Ring degrees per step"),
+                );
+                ui.checkbox(
+                    &mut s.pinch_zoom,
+                    "Pinch to zoom (touch surface or touchpad)",
+                );
+            });
+
+            ui.separator();
+            if ui.button("Reset to defaults").clicked() {
+                *s = TabletSettings {
+                    activation: s.activation,
+                    ..TabletSettings::default()
+                };
+            }
+        });
+    if !open {
+        ui_state.tablet_settings_open = false;
+    }
+}
+
+/// Detected devices and whether the settings currently apply.
+fn tablet_status(ui: &mut egui::Ui, ui_state: &UiState) {
+    let tablets = &ui_state.tablet_devices.tablets;
+    if tablets.is_empty() {
+        ui.label("No tablet detected.");
+    }
+    for tablet in tablets {
+        let vendor = if tablet.vendor_id == WACOM_VENDOR_ID {
+            " — Wacom"
+        } else {
+            ""
+        };
+        ui.label(format!(
+            "{} ({:04x}:{:04x}){vendor}",
+            tablet.name, tablet.vendor_id, tablet.product_id
+        ));
+    }
+    for pad in &ui_state.tablet_devices.pads {
+        ui.label(format!(
+            "Controls: {} keys, {} ring(s), {} strip(s), {} mode(s)",
+            pad.buttons, pad.rings, pad.strips, pad.modes
+        ));
+    }
+    if let Some(pen) = ui_state.tablet_pen {
+        let mut axes = Vec::new();
+        if pen.has_tilt {
+            axes.push("tilt");
+        }
+        if pen.has_rotation {
+            axes.push("rotation");
+        }
+        if pen.has_distance {
+            axes.push("hover height");
+        }
+        ui.label(format!(
+            "Pen: {:?}, serial {:#x}, reports {}",
+            pen.kind,
+            pen.serial,
+            if axes.is_empty() {
+                "pressure only".to_string()
+            } else {
+                format!("pressure, {}", axes.join(", "))
+            }
+        ));
+    }
+    let vendors: Vec<u32> = tablets.iter().map(|t| t.vendor_id).collect();
+    let active = ui_state.tablet_settings.applies(&vendors);
+    let (text, color) = if active {
+        ("Settings active", Color32::from_rgb(34, 197, 94))
+    } else {
+        (
+            "Settings inactive — tablet behaves as a plain pen",
+            Color32::from_rgb(148, 163, 184),
+        )
+    };
+    ui.colored_label(color, text);
+}
+
+/// Small plot of raw → applied pressure.
+fn pressure_curve_plot(ui: &mut egui::Ui, settings: &TabletSettings) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(160.0, 90.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0_f32, Color32::from_gray(120)),
+        egui::StrokeKind::Inside,
+    );
+    let points: Vec<Pos2> = (0..=40)
+        .map(|i| {
+            let raw = i as f64 / 40.0;
+            let out = settings.map_pressure(raw);
+            Pos2::new(
+                rect.left() + raw as f32 * rect.width(),
+                rect.bottom() - out as f32 * rect.height(),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(2.0_f32, Color32::from_rgb(99, 102, 241)),
+    ));
+}
+
+fn button_action_combo(ui: &mut egui::Ui, label: &str, action: &mut ButtonAction) {
+    egui::ComboBox::from_label(label)
+        .selected_text(action.label())
+        .height(400.0)
+        .show_ui(ui, |ui| {
+            for choice in ButtonAction::choices() {
+                ui.selectable_value(action, choice, choice.label());
+            }
+        });
+}
+
+fn ring_action_combo(ui: &mut egui::Ui, label: &str, action: &mut RingAction) {
+    egui::ComboBox::from_label(label)
+        .selected_text(action.label())
+        .show_ui(ui, |ui| {
+            for choice in RingAction::ALL {
+                ui.selectable_value(action, choice, choice.label());
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn color(action: Option<UiAction>) -> Option<Color32> {
+        match action {
+            Some(UiAction::SetStrokeColor(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_shortcut_action() {
+        let shade = |i: usize| TAILWIND_COLORS[i].shades[6];
+        let ui = UiState::default();
+        let act = |key, digit, ctrl, shift, alt| shortcut_action(key, digit, ctrl, shift, alt, &ui);
+
+        assert!(matches!(
+            act("=", None, true, false, false),
+            Some(UiAction::ZoomIn)
+        ));
+        assert!(matches!(
+            act("-", None, true, false, false),
+            Some(UiAction::ZoomOut)
+        ));
+        assert!(matches!(
+            act("0", Some(0), true, false, false),
+            Some(UiAction::ZoomReset)
+        ));
+        assert!(matches!(
+            act("!", Some(1), false, true, false),
+            Some(UiAction::ZoomToFit)
+        ));
+        assert!(matches!(
+            act("Home", None, false, false, false),
+            Some(UiAction::CenterCanvas)
+        ));
+        assert!(act("z", None, true, false, false).is_none());
+        assert!(act("1", Some(1), false, false, false).is_none());
+
+        assert_eq!(
+            color(act("1", Some(1), false, false, true)),
+            Some(shade(10))
+        );
+        assert_eq!(
+            color(act("6", Some(6), false, false, true)),
+            Some(shade(17))
+        );
+        let width = |d| match act("", Some(d), false, false, true) {
+            Some(UiAction::SetStrokeWidth(w)) => Some(w),
+            _ => None,
+        };
+        assert_eq!(
+            [width(7), width(8), width(9), width(0)],
+            [Some(1.0), Some(2.0), Some(4.0), Some(8.0)]
+        );
+    }
+
+    #[test]
+    fn test_cycle_stroke_color() {
+        let shade = |i: usize| TAILWIND_COLORS[i].shades[6];
+        let last = TAILWIND_COLORS.len() - 1;
+        assert_eq!(cycle_stroke_color(shade(11), 1), shade(12));
+        assert_eq!(cycle_stroke_color(shade(11), -1), shade(10));
+        assert_eq!(cycle_stroke_color(shade(last), 1), shade(0));
+        assert_eq!(cycle_stroke_color(shade(0), -1), shade(last));
+        let custom = Color32::from_rgb(1, 2, 3);
+        assert_eq!(cycle_stroke_color(custom, 1), shade(0));
+        assert_eq!(cycle_stroke_color(custom, -1), shade(last));
+    }
 }
