@@ -1,22 +1,198 @@
-//! Practice sheets: every letter, number and symbol written with each brush
-//! at each stroke width, laid out on handwriting or calligraphy guide lines,
-//! with an empty row after each line to copy it.
+//! Practice sheets: every letter, number and symbol in a handwriting or
+//! calligraphy style, on matching guide lines, with an empty row after each
+//! line to copy it. Most styles show each brush at each stroke width; the
+//! outlined styles are grey letters to trace with any brush.
 //!
-//! Letters come from two Hershey stroke fonts (see `assets/hershey`), drawn
+//! Letters come from single-line stroke fonts (see `assets/practice`), drawn
 //! as pen strokes so every brush renders them as it would your writing.
 
 use crate::canvas::CanvasDocument;
 use crate::shapes::{Brush, Freehand, SerializableColor, Shape, Text};
 use kurbo::Point;
 
-/// Which practice sheet to build.
+/// Handwriting (3-line paper) or calligraphy (4-line paper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PracticeSheet {
-    /// Print letters on three-line handwriting paper.
+pub enum SheetKind {
     Handwriting,
-    /// Cursive script on four-line calligraphy paper, slanted.
     Calligraphy,
 }
+
+impl SheetKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SheetKind::Handwriting => "Handwriting practice",
+            SheetKind::Calligraphy => "Calligraphy practice",
+        }
+    }
+}
+
+/// How a style's letters are shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Every brush at every stroke width.
+    Brushes,
+    /// The letters are drawn as outlines (double lines): one block of grey
+    /// letters to trace over.
+    Trace,
+}
+
+/// A lettering style: its font and how to show it.
+struct Style {
+    kind: SheetKind,
+    name: &'static str,
+    font: &'static str,
+    /// Extra slant applied to the font, in degrees from upright.
+    shear: f64,
+    mode: Mode,
+}
+
+macro_rules! font {
+    ($file:literal) => {
+        include_str!(concat!("../assets/practice/", $file, ".strokes"))
+    };
+}
+
+const STYLES: &[Style] = &[
+    // Handwriting
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "Print",
+        font: font!("romans"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "Slanted print",
+        font: font!("romans"),
+        shear: 10.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "Clean print",
+        font: font!("EMSReadability"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "Clean italic print",
+        font: font!("EMSReadabilityItalic"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "Casual hand",
+        font: font!("EMSTech"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "Typewriter print",
+        font: font!("EMSNixish"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "School cursive",
+        font: font!("scripts"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Handwriting,
+        name: "Serif print (trace)",
+        font: font!("romanc"),
+        shear: 0.0,
+        mode: Mode::Trace,
+    },
+    // Calligraphy
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Copperplate script",
+        font: font!("scripts"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Formal script",
+        font: font!("EMSAllure"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Chancery",
+        font: font!("EMSFelix"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Slanted roman (italic hand)",
+        font: font!("romans"),
+        shear: 8.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Italic",
+        font: font!("EMSNixishItalic"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Decorative",
+        font: font!("EMSElfin"),
+        shear: 0.0,
+        mode: Mode::Brushes,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Blackletter (trace)",
+        font: font!("gotheng"),
+        shear: 0.0,
+        mode: Mode::Trace,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Fraktur (trace)",
+        font: font!("gothger"),
+        shear: 0.0,
+        mode: Mode::Trace,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Rotunda (trace)",
+        font: font!("gothita"),
+        shear: 0.0,
+        mode: Mode::Trace,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Formal script (trace)",
+        font: font!("scriptc"),
+        shear: 0.0,
+        mode: Mode::Trace,
+    },
+    Style {
+        kind: SheetKind::Calligraphy,
+        name: "Italic (trace)",
+        font: font!("italicc"),
+        shear: 0.0,
+        mode: Mode::Trace,
+    },
+];
+
+/// A practice sheet: one lettering style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PracticeSheet(usize);
 
 /// Guide line proportions a sheet is laid out on. Show the matching writing
 /// guides grid with these values so the letters sit on the lines.
@@ -57,6 +233,13 @@ const INK: SerializableColor = SerializableColor {
     b: 59,
     a: 255,
 };
+/// Letters to trace over: light enough that your own strokes stand out.
+const TRACE: SerializableColor = SerializableColor {
+    r: 148,
+    g: 163,
+    b: 184,
+    a: 255,
+};
 const LABEL: SerializableColor = SerializableColor {
     r: 100,
     g: 116,
@@ -65,68 +248,77 @@ const LABEL: SerializableColor = SerializableColor {
 };
 
 impl PracticeSheet {
-    pub fn title(self) -> &'static str {
-        match self {
-            PracticeSheet::Handwriting => "Handwriting practice",
-            PracticeSheet::Calligraphy => "Calligraphy practice",
-        }
+    /// Every sheet, handwriting first.
+    pub fn all() -> impl Iterator<Item = PracticeSheet> {
+        (0..STYLES.len()).map(PracticeSheet)
     }
 
-    /// Font data and its metrics in font units: (data, x-height,
-    /// ascender above the x-height, descender below the baseline).
-    fn font(self) -> (&'static str, f64, f64, f64) {
-        match self {
-            PracticeSheet::Handwriting => {
-                (include_str!("../assets/hershey/romans.jhf"), 14.0, 7.0, 7.0)
-            }
-            PracticeSheet::Calligraphy => (
-                include_str!("../assets/hershey/scripts.jhf"),
-                9.0,
-                12.0,
-                12.0,
-            ),
-        }
+    fn style(self) -> &'static Style {
+        &STYLES[self.0]
     }
 
-    /// Canvas units per font unit.
-    fn scale(self) -> f64 {
-        match self {
-            PracticeSheet::Handwriting => 3.0,
-            PracticeSheet::Calligraphy => 4.5,
+    pub fn kind(self) -> SheetKind {
+        self.style().kind
+    }
+
+    /// The style's name, e.g. "Chancery".
+    pub fn name(self) -> &'static str {
+        self.style().name
+    }
+
+    /// Full title, e.g. "Calligraphy practice: Chancery".
+    pub fn title(self) -> String {
+        format!("{}: {}", self.kind().name(), self.name())
+    }
+
+    fn font(self) -> Font {
+        Font::parse(self.style().font)
+    }
+
+    /// Letter size: brush sheets at a comfortable writing size, letters to
+    /// trace larger.
+    fn x_height(self) -> f64 {
+        match self.style().mode {
+            Mode::Brushes => 40.0,
+            Mode::Trace => 60.0,
         }
     }
 
     /// The guide lines this sheet is laid out on.
     pub fn guides(self) -> SheetGuides {
-        let (_, x_height, ascender, descender) = self.font();
+        let font = self.font();
+        let slant = font.slant + self.style().shear;
         SheetGuides {
-            x_height: x_height * self.scale(),
-            ascender: ascender / x_height,
-            descender: descender / x_height,
+            x_height: self.x_height(),
+            ascender: font.ascender / font.x_height,
+            descender: font.descender / font.x_height,
             row_gap: 0.5,
-            slant: match self {
-                PracticeSheet::Handwriting => 0.0,
-                PracticeSheet::Calligraphy => 12.0,
+            // Upright styles get no slant lines.
+            slant: if slant.abs() < 3.0 {
+                0.0
+            } else {
+                slant.round()
             },
         }
     }
 
-    /// Build the sheet: one block per brush (down) and stroke width (across).
+    /// Build the sheet: for brush styles one block per brush (down) and
+    /// stroke width (across); for outlined styles one block to trace.
     pub fn build(self) -> CanvasDocument {
-        let (data, ..) = self.font();
-        let glyphs = parse_font(data);
+        let font = self.font();
         let guides = self.guides();
         let row = guides.row_height();
         let x_height = guides.x_height;
-        let scale = self.scale();
+        let scale = x_height / font.x_height;
+        let shear = self.style().shear.to_radians().tan();
         // Letters are spaced apart so each can be traced on its own.
         let spacing = x_height * 0.6;
         let label_width = x_height * 5.0;
 
         let line_width = |text: &str| -> f64 {
             text.chars()
-                .filter_map(|c| glyph(&glyphs, c))
-                .map(|g| (g.right - g.left) * scale + spacing)
+                .filter_map(|c| font.glyph(c))
+                .map(|g| g.advance * scale + spacing)
                 .sum()
         };
         let block_width = label_width
@@ -137,34 +329,46 @@ impl PracticeSheet {
             + x_height * 4.0;
 
         let mut doc = CanvasDocument::new();
-        doc.name = self.title().to_string();
+        doc.name = self.title();
         let left = x_height * 2.0;
 
-        // Title and instructions.
-        let mut add_text =
-            |doc: &mut CanvasDocument, x: f64, baseline: f64, size: f64, text: &str| {
-                let mut label = Text::new(Point::new(x, baseline - size * 1.25), text.to_string())
-                    .with_font_size(size);
-                label.style.stroke_color = LABEL;
-                doc.add_shape(Shape::Text(label));
+        let add_text = |doc: &mut CanvasDocument, x: f64, baseline: f64, size: f64, text: &str| {
+            let mut label = Text::new(Point::new(x, baseline - size * 1.25), text.to_string())
+                .with_font_size(size);
+            label.style.stroke_color = LABEL;
+            doc.add_shape(Shape::Text(label));
+        };
+        add_text(&mut doc, left, row, x_height * 1.2, &self.title());
+        let instructions = match self.style().mode {
+            Mode::Brushes => {
+                "Each block is one brush (down) at one stroke width (across): uppercase, \
+                 lowercase, numbers and symbols,\neach with an empty row below to write it \
+                 yourself. Pick the same brush and width in the pen panel and copy along the lines."
+            }
+            Mode::Trace => {
+                "Trace over the grey letters with any brush, then write each line yourself in \
+                 the empty row below it."
+            }
+        };
+        add_text(&mut doc, left, row * 2.0, x_height * 0.5, instructions);
+
+        let blocks: Vec<(Brush, f64, SerializableColor)> = match self.style().mode {
+            Mode::Brushes => Brush::ALL
+                .into_iter()
+                .flat_map(|brush| WIDTHS.into_iter().map(move |w| (brush, w, INK)))
+                .collect(),
+            Mode::Trace => vec![(Brush::Pen, 1.0, TRACE)],
+        };
+        for (i, &(brush, width, color)) in blocks.iter().enumerate() {
+            let (down, across) = match self.style().mode {
+                Mode::Brushes => (i / WIDTHS.len(), i % WIDTHS.len()),
+                Mode::Trace => (0, 0),
             };
-        add_text(&mut doc, left, row, x_height * 1.2, self.title());
-        add_text(
-            &mut doc,
-            left,
-            row * 2.0,
-            x_height * 0.5,
-            "Each block is one brush (down) at one stroke width (across): uppercase, lowercase, \
-             numbers and symbols,\neach with an empty row below to copy it. Pick the same \
-             brush and width in the pen panel and write along the lines.",
-        );
+            let x0 = left + across as f64 * block_width;
+            let first_row = HEADER_ROWS + down * BLOCK_ROWS;
+            let baseline = |r: usize| (first_row + r) as f64 * row;
 
-        for (b, brush) in Brush::ALL.into_iter().enumerate() {
-            for (w, width) in WIDTHS.into_iter().enumerate() {
-                let x0 = left + w as f64 * block_width;
-                let first_row = HEADER_ROWS + b * BLOCK_ROWS;
-                let baseline = |r: usize| (first_row + r) as f64 * row;
-
+            if self.style().mode == Mode::Brushes {
                 add_text(
                     &mut doc,
                     x0,
@@ -172,37 +376,34 @@ impl PracticeSheet {
                     x_height * 0.7,
                     &format!("{} · {width} px", brush.name()),
                 );
-                let lines = [
-                    ("Uppercase", UPPERCASE),
-                    ("Lowercase", LOWERCASE),
-                    ("Numbers", NUMBERS),
-                    ("Symbols", SYMBOLS),
-                ];
-                for (l, (name, text)) in lines.into_iter().enumerate() {
-                    let base = baseline(1 + l * 2);
-                    add_text(&mut doc, x0, base, x_height * 0.4, name);
-                    let mut cursor = x0 + label_width;
-                    for c in text.chars() {
-                        let Some(g) = glyph(&glyphs, c) else {
-                            continue;
-                        };
-                        for stroke in &g.strokes {
-                            let points: Vec<Point> = stroke
-                                .iter()
-                                .map(|p| {
-                                    Point::new(
-                                        cursor + (p.x - g.left) * scale,
-                                        // Font baseline is at y = 9.
-                                        base + (p.y - 9.0) * scale,
-                                    )
-                                })
-                                .collect();
-                            if let Some(shape) = pen_stroke(&points, brush, width) {
-                                doc.add_shape(shape);
-                            }
+            }
+            let lines = [
+                ("Uppercase", UPPERCASE),
+                ("Lowercase", LOWERCASE),
+                ("Numbers", NUMBERS),
+                ("Symbols", SYMBOLS),
+            ];
+            for (l, (name, text)) in lines.into_iter().enumerate() {
+                let base = baseline(1 + l * 2);
+                add_text(&mut doc, x0, base, x_height * 0.4, name);
+                let mut cursor = x0 + label_width;
+                for c in text.chars() {
+                    let Some(g) = font.glyph(c) else {
+                        continue;
+                    };
+                    for stroke in &g.strokes {
+                        let points: Vec<Point> = stroke
+                            .iter()
+                            .map(|p| {
+                                // Font y is up from the baseline.
+                                Point::new(cursor + (p.x + p.y * shear) * scale, base - p.y * scale)
+                            })
+                            .collect();
+                        if let Some(shape) = pen_stroke(&points, brush, width, color) {
+                            doc.add_shape(shape);
                         }
-                        cursor += (g.right - g.left) * scale + spacing;
                     }
+                    cursor += g.advance * scale + spacing;
                 }
             }
         }
@@ -210,54 +411,95 @@ impl PracticeSheet {
     }
 }
 
-/// One Hershey glyph, in font units (y down, baseline at 9).
+/// A single-line font in font units, y up from the baseline.
+struct Font {
+    x_height: f64,
+    /// Above the x-height.
+    ascender: f64,
+    /// Below the baseline.
+    descender: f64,
+    /// Degrees from upright.
+    slant: f64,
+    /// Printable ASCII from space (32).
+    glyphs: Vec<Glyph>,
+}
+
 struct Glyph {
-    left: f64,
-    right: f64,
+    advance: f64,
     strokes: Vec<Vec<Point>>,
 }
 
-/// Parse `.jhf` lines numbered by character code (32 = space).
-fn parse_font(data: &str) -> Vec<Glyph> {
-    data.lines()
-        .filter(|line| line.len() >= 10)
-        .map(|line| {
-            let coord = |c: u8| f64::from(c) - f64::from(b'R');
-            let bytes = &line.as_bytes()[8..];
-            let mut strokes = vec![Vec::new()];
-            for pair in bytes[2..].chunks_exact(2) {
-                if pair == b" R" {
-                    strokes.push(Vec::new());
-                } else {
-                    strokes
-                        .last_mut()
-                        .unwrap()
-                        .push(Point::new(coord(pair[0]), coord(pair[1])));
+impl Font {
+    /// Parse the `.strokes` format (see `assets/practice/README.md`).
+    fn parse(data: &str) -> Self {
+        let mut font = Font {
+            x_height: 1.0,
+            ascender: 0.0,
+            descender: 0.0,
+            slant: 0.0,
+            glyphs: Vec::new(),
+        };
+        for line in data.lines().filter(|l| !l.starts_with('#')) {
+            let mut parts = line.splitn(3, ' ');
+            let (Some(first), Some(second)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if first == "metrics" {
+                let values: Vec<f64> = line
+                    .split_whitespace()
+                    .skip(1)
+                    .filter_map(|v| v.parse().ok())
+                    .collect();
+                if let [x_height, ascender, descender, slant] = values[..] {
+                    font.x_height = x_height.max(f64::EPSILON);
+                    font.ascender = ascender;
+                    font.descender = descender;
+                    font.slant = slant;
                 }
+                continue;
             }
-            strokes.retain(|s| !s.is_empty());
-            Glyph {
-                left: coord(bytes[0]),
-                right: coord(bytes[1]),
+            let strokes = parts
+                .next()
+                .unwrap_or("")
+                .split('|')
+                .map(|stroke| {
+                    stroke
+                        .split_whitespace()
+                        .filter_map(|xy| {
+                            let (x, y) = xy.split_once(',')?;
+                            Some(Point::new(x.parse().ok()?, y.parse().ok()?))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            font.glyphs.push(Glyph {
+                advance: second.parse().unwrap_or(0.0),
                 strokes,
-            }
-        })
-        .collect()
-}
+            });
+        }
+        font
+    }
 
-fn glyph(glyphs: &[Glyph], c: char) -> Option<&Glyph> {
-    glyphs.get((c as usize).checked_sub(32)?)
+    fn glyph(&self, c: char) -> Option<&Glyph> {
+        self.glyphs.get((c as usize).checked_sub(32)?)
+    }
 }
 
 /// A pen stroke through a glyph's polyline: curves smoothed, corners kept,
 /// and pressure easing in and out like a written stroke.
-fn pen_stroke(polyline: &[Point], brush: Brush, width: f64) -> Option<Shape> {
+fn pen_stroke(
+    polyline: &[Point],
+    brush: Brush,
+    width: f64,
+    color: SerializableColor,
+) -> Option<Shape> {
     // Sparse enough to stay light; the renderer smooths between points.
     let points = smooth(polyline, 4.0);
     if points.len() < 2 {
         // A dot (e.g. in "i" or ":"): a tiny stroke so it still shows.
         let p = *polyline.first()?;
-        return pen_stroke(&[p, p + kurbo::Vec2::new(0.5, 0.5)], brush, width);
+        return pen_stroke(&[p, p + kurbo::Vec2::new(0.5, 0.5)], brush, width, color);
     }
     let lengths: Vec<f64> = std::iter::once(0.0)
         .chain(points.windows(2).scan(0.0, |total, w| {
@@ -274,7 +516,7 @@ fn pen_stroke(polyline: &[Point], brush: Brush, width: f64) -> Option<Shape> {
     let mut stroke = Freehand::from_points_with_pressure(points, pressures);
     stroke.brush = brush;
     stroke.style.stroke_width = width;
-    stroke.style.stroke_color = INK;
+    stroke.style.stroke_color = color;
     Some(Shape::Freehand(stroke))
 }
 
@@ -341,20 +583,27 @@ mod tests {
 
     #[test]
     fn test_fonts_cover_printable_ascii() {
-        for sheet in [PracticeSheet::Handwriting, PracticeSheet::Calligraphy] {
-            let glyphs = parse_font(sheet.font().0);
-            assert_eq!(glyphs.len(), 95);
-            for c in [UPPERCASE, LOWERCASE, NUMBERS, SYMBOLS].concat().chars() {
-                let g = glyph(&glyphs, c).unwrap();
-                assert!(!g.strokes.is_empty(), "{c:?} has no strokes");
-                assert!(g.right > g.left);
+        for sheet in PracticeSheet::all() {
+            let font = sheet.font();
+            assert_eq!(font.glyphs.len(), 95, "{}", sheet.name());
+            for c in [UPPERCASE, LOWERCASE, NUMBERS].concat().chars() {
+                let g = font.glyph(c).unwrap();
+                assert!(!g.strokes.is_empty(), "{c:?} missing in {}", sheet.name());
+                assert!(g.advance > 0.0);
             }
         }
     }
 
     #[test]
-    fn test_sheet_has_every_combination() {
-        let doc = PracticeSheet::Handwriting.build();
+    fn test_both_kinds_have_sheets() {
+        for kind in [SheetKind::Handwriting, SheetKind::Calligraphy] {
+            assert!(PracticeSheet::all().filter(|s| s.kind() == kind).count() >= 5);
+        }
+    }
+
+    #[test]
+    fn test_brush_sheet_has_every_combination() {
+        let doc = PracticeSheet(0).build();
         let strokes: Vec<_> = doc
             .shapes_ordered()
             .filter_map(|s| match s {
@@ -375,13 +624,16 @@ mod tests {
 
     #[test]
     fn test_letters_sit_on_the_guides() {
-        // "x" spans exactly baseline to x-height.
-        let sheet = PracticeSheet::Handwriting;
-        let glyphs = parse_font(sheet.font().0);
-        let x = glyph(&glyphs, 'x').unwrap();
+        // Print "x" spans exactly baseline to x-height.
+        let sheet = PracticeSheet(0);
+        let font = sheet.font();
+        let x = font.glyph('x').unwrap();
         let ys = x.strokes.iter().flatten().map(|p| p.y);
-        let (top, bottom) = ys.fold((f64::MAX, f64::MIN), |(a, b), y| (a.min(y), b.max(y)));
-        assert_eq!((bottom - top) * sheet.scale(), sheet.guides().x_height);
-        assert_eq!(bottom, 9.0);
+        let (low, high) = ys.fold((f64::MAX, f64::MIN), |(a, b), y| (a.min(y), b.max(y)));
+        assert_eq!(low, 0.0);
+        assert_eq!(
+            high * sheet.guides().x_height / font.x_height,
+            sheet.guides().x_height
+        );
     }
 }

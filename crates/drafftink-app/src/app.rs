@@ -4310,7 +4310,7 @@ impl ApplicationHandler<UserEvent> for App {
                         UiAction::ShowPractice(sheet) => {
                             // Its own tab (reused if still open), on the
                             // guide lines the letters were laid out on.
-                            let title = sheet.title().to_string();
+                            let title = sheet.title();
                             match state.tabs.iter().position(|t| t.name == title) {
                                 Some(index) => switch_to_tab(state, index),
                                 None => {
@@ -4328,11 +4328,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 row_gap: guides.row_gap,
                                 slant: guides.slant,
                             };
-                            let style = match sheet {
-                                drafftink_core::practice::PracticeSheet::Handwriting => {
+                            let style = match sheet.kind() {
+                                drafftink_core::practice::SheetKind::Handwriting => {
                                     GridStyle::Handwriting
                                 }
-                                drafftink_core::practice::PracticeSheet::Calligraphy => {
+                                drafftink_core::practice::SheetKind::Calligraphy => {
                                     GridStyle::Calligraphy
                                 }
                             };

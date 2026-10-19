@@ -1,5 +1,6 @@
 //! UI components using egui.
 
+use drafftink_core::practice::{PracticeSheet, SheetKind};
 use drafftink_core::shapes::{
     Brush, FillPattern, FontFamily, FontWeight, Shape, ShapeId, ShapeStyle,
 };
@@ -272,6 +273,8 @@ pub struct UiState {
     pub writing_guides: WritingGuides,
     /// Tools and colours shown next to the pointer, when open.
     pub quick_bars: Option<QuickBars>,
+    /// Practice sheet submenu open in the main menu.
+    pub practice_submenu: Option<drafftink_core::practice::SheetKind>,
     /// Current zoom level (1.0 = 100%).
     pub zoom_level: f64,
     /// Whether grid snapping is enabled.
@@ -377,6 +380,7 @@ impl Default for UiState {
             grid_style: GridStyle::default(),
             writing_guides: WritingGuides::default(),
             quick_bars: None,
+            practice_submenu: None,
             zoom_level: drafftink_core::camera::BASE_ZOOM,
             grid_snap_enabled: false,
             smart_snap_enabled: false,
@@ -2406,6 +2410,9 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
             });
         });
 
+    // Practice submenu: the parent item and its rect, set while drawing the menu.
+    let mut practice_anchor: Option<(SheetKind, Rect)> = None;
+
     // Dropdown menu (only shown when open)
     if ui_state.menu_open {
         egui::Area::new(egui::Id::new("file_menu_dropdown"))
@@ -2450,14 +2457,24 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                             ui_state.menu_open = false;
                         }
 
-                        for sheet in [
-                            drafftink_core::practice::PracticeSheet::Handwriting,
-                            drafftink_core::practice::PracticeSheet::Calligraphy,
-                        ] {
-                            if menu_item(ui, &format!("{} Intro", sheet.title()), "") {
-                                action = Some(UiAction::ShowPractice(sheet));
-                                ui_state.menu_open = false;
+                        // Practice sheet submenus open on hover (or click).
+                        let mut over_parent = false;
+                        for kind in [SheetKind::Handwriting, SheetKind::Calligraphy] {
+                            let item =
+                                ui.scope(|ui| menu_item(ui, &format!("{}  ›", kind.name()), ""));
+                            let hovered = ui.rect_contains_pointer(item.response.rect);
+                            over_parent |= hovered;
+                            if item.inner || hovered {
+                                ui_state.practice_submenu = Some(kind);
                             }
+                            if ui_state.practice_submenu == Some(kind) {
+                                practice_anchor = Some((kind, item.response.rect));
+                            }
+                        }
+                        // Hovering another item closes the submenu.
+                        if !over_parent && ui.ui_contains_pointer() {
+                            ui_state.practice_submenu = None;
+                            practice_anchor = None;
                         }
 
                         widgets_menu_separator(ui);
@@ -2577,6 +2594,26 @@ fn render_file_menu(ctx: &Context, ui_state: &mut UiState) -> Option<UiAction> {
                     ui_state.menu_open = false;
                 }
             }
+        }
+
+        if let Some((kind, rect)) = practice_anchor {
+            egui::Area::new(egui::Id::new("practice_submenu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.right_top() + Vec2::new(10.0, -8.0))
+                .constrain(true)
+                .show(ctx, |ui| {
+                    panel_frame().show(ui, |ui| {
+                        ui.set_width(220.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+                        for sheet in PracticeSheet::all().filter(|s| s.kind() == kind) {
+                            if menu_item(ui, sheet.name(), "") {
+                                action = Some(UiAction::ShowPractice(sheet));
+                                ui_state.menu_open = false;
+                                ui_state.practice_submenu = None;
+                            }
+                        }
+                    });
+                });
         }
     }
 

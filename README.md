@@ -99,12 +99,20 @@ Press **Q** (or bind "Tools and colours at pointer" to a pen or tablet button)
 to bring the tools and colours to the pointer: tools to its left, colours above
 it. Tap and click an item, or hold, move onto an item and release.
 
-**Menu → Handwriting practice Intro / Calligraphy practice Intro** open practice
-sheets in their own tab: every uppercase and lowercase letter, number and symbol,
-written with each brush at each stroke width, with an empty row after each line
-to copy it. Handwriting uses print letters on 3-line paper; calligraphy uses
-cursive script on slanted 4-line paper. Letters come from the Hershey stroke
-fonts (see `crates/drafftink-core/assets/hershey`).
+**Menu → Handwriting practice ›** and **Calligraphy practice ›** open practice
+sheets in their own tab: every uppercase and lowercase letter, number and symbol
+in a lettering style, on matching guide lines, each line followed by an empty
+row to write it yourself.
+
+- Handwriting: Print, Slanted print, Clean print, Clean italic print, Casual
+  hand, Typewriter print, School cursive, Serif print (trace)
+- Calligraphy: Copperplate script, Formal script, Chancery, Slanted roman
+  (italic hand), Italic, Decorative, Blackletter, Fraktur, Rotunda, Formal
+  script and Italic (the last five to trace)
+
+Most styles show every brush at every stroke width; "trace" styles are grey
+outlines to trace with any brush. Letters come from the Hershey and EMS
+single-line fonts (credits and licences in `crates/drafftink-core/assets/practice`).
 
 Settings are saved in `~/.config/drafftink/` (`keybindings.json`, `tablet.json`,
 `preferences.json`).
