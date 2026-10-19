@@ -12,13 +12,17 @@ mod text;
 
 pub use arrow::Arrow;
 pub use ellipse::Ellipse;
-pub use freehand::{Brush, DEFAULT_NIB_ANGLE, Freehand, pressure_width};
+pub use freehand::Freehand;
 pub use group::Group;
 pub use image::{Image, ImageFormat};
 pub use line::{Line, PathStyle};
 pub use math::Math;
 pub use rectangle::Rectangle;
 pub use text::{FontFamily, FontWeight, Text};
+
+// This fork's additions.
+mod brush;
+pub use brush::{Brush, DEFAULT_NIB_ANGLE, pressure_width};
 
 use kurbo::{Affine, BezPath, Point, Rect};
 use peniko::Color;

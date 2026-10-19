@@ -229,6 +229,37 @@ has no newer commits to merge in.
 plain pen strokes, and saving from upstream drops them. Settings this fork
 adds live in `~/.config/drafftink/`, which upstream doesn't read.
 
+**Keeping up with upstream.** The fork's code lives in its own files, so
+upstream's files change as little as possible and upstream changes merge with
+few conflicts. In upstream's files there are mostly short calls into them:
+
+| Upstream file | Fork code in |
+|---|---|
+| `drafftink-app/src/app.rs` | `app/` (`actions`, `commands`, `documents`, `extra`, `file_io`, `pen_input`) |
+| `drafftink-app/src/ui.rs` | `ui/` (`menu`, `tab_strip`, `settings`, `quick_bars`, `queued`, `prompts`, `guides`, `stroke`) |
+| `drafftink-render/src/vello_impl.rs` | `vello_impl/` (`brushes`, `overlays`) |
+| `drafftink-render/src/renderer.rs` | `writing_guides.rs` |
+| `drafftink-core/src/shapes/freehand.rs` | `shapes/brush.rs` |
+
+To bring in upstream changes:
+
+```bash
+git remote add upstream https://github.com/PatWie/drafft-ink.git  # once
+git config rerere.enabled true    # once: reuse conflict resolutions
+git fetch upstream
+git rebase -Xignore-space-change upstream/main
+cargo fmt --all
+```
+
+(Use whatever name your remote for PatWie/drafft-ink has.)
+
+`-Xignore-space-change` matters: the properties panel was re-indented when it
+became shared with the toolbars at the pointer, and without it any upstream
+change to that panel conflicts across all ~500 lines. Conflicts that remain are
+usually both sides adding a line in the same place (keep both). Upstream's
+keyboard shortcuts dialog and `shortcuts.rs` were removed in favour of the
+Settings window; if upstream changes them, keep them removed.
+
 ---
 
 ## Philosophy
