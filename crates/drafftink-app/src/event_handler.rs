@@ -337,6 +337,20 @@ impl EventHandler {
                 }
             }
             ToolKind::Select => {
+                if canvas.selection.len() > 1 {
+                    let group = Shape::Group(drafftink_core::shapes::Group::new(
+                        canvas
+                            .selection
+                            .iter()
+                            .filter_map(|id| canvas.document.get_shape(*id).cloned())
+                            .collect(),
+                    ));
+                    if let Some(handle @ HandleKind::Corner(_)) =
+                        hit_test_handles(&group, world_point, handle_tolerance)
+                    {
+                        return Some(Some(handle));
+                    }
+                }
                 for &shape_id in &canvas.selection {
                     if let Some(shape) = canvas.document.get_shape(shape_id) {
                         if let Some(handle) = hit_test_handles(shape, world_point, handle_tolerance)
@@ -348,7 +362,7 @@ impl EventHandler {
                 let hits = canvas
                     .document
                     .shapes_at_point(world_point, 5.0 / canvas.camera.zoom);
-                if !hits.is_empty() {
+                if !hits.is_empty() || selected_bounds_hit(canvas, world_point).is_some() {
                     return Some(None); // move
                 }
             }
@@ -518,12 +532,7 @@ impl EventHandler {
                 let hits = canvas
                     .document
                     .shapes_at_point(world_point, 5.0 / canvas.camera.zoom);
-                let selected_hit = canvas.selection.iter().copied().find(|id| {
-                    canvas
-                        .document
-                        .get_shape(*id)
-                        .is_some_and(|shape| shape.bounds().contains(world_point))
-                });
+                let selected_hit = selected_bounds_hit(canvas, world_point);
                 if let Some(id) = selected_hit.or_else(|| hits.first().copied()) {
                     if input.shift() {
                         // Add to/toggle selection
@@ -1512,6 +1521,44 @@ mod selection_tests {
         );
     }
     #[test]
+    fn drag_empty_space_between_selected_items_moves_every_item() {
+        let mut canvas = Canvas::new();
+        canvas.set_tool(ToolKind::Select);
+        for shape in [rectangle(0.0), rectangle(200.0)] {
+            let id = shape.id();
+            canvas.document.add_shape(shape);
+            canvas.add_to_selection(id);
+        }
+        let input = InputState::new();
+        let mut handler = EventHandler::new();
+        let start = Point::new(150.0, 50.0);
+        assert_eq!(handler.get_cursor_for_position(&canvas, start), Some(None));
+        handler.handle_press(&mut canvas, start, &input, false);
+        assert!(handler.multi_move.is_some());
+        handler.handle_drag(
+            &mut canvas,
+            Point::new(180.0, 90.0),
+            &input,
+            false,
+            false,
+            false,
+        );
+        handler.handle_release(
+            &mut canvas,
+            Point::new(180.0, 90.0),
+            &input,
+            &ShapeStyle::default(),
+            false,
+            false,
+        );
+        for (index, id) in canvas.selection.iter().enumerate() {
+            let bounds = canvas.document.get_shape(*id).unwrap().bounds();
+            assert_eq!(bounds.x0, index as f64 * 200.0 + 30.0);
+            assert_eq!(bounds.y0, 40.0);
+        }
+    }
+
+    #[test]
     fn aggregate_resize_commits_one_undo_step() {
         let mut canvas = Canvas::new();
         canvas.set_tool(ToolKind::Select);
@@ -1549,5 +1596,20 @@ mod selection_tests {
             canvas.document.get_shape(id).unwrap().bounds().width(),
             100.0
         );
+    }
+}
+
+/// Empty space within a multi-selection's overall box remains draggable.
+fn selected_bounds_hit(canvas: &Canvas, point: Point) -> Option<ShapeId> {
+    let bounds = canvas
+        .selection
+        .iter()
+        .filter_map(|id| canvas.document.get_shape(*id))
+        .map(|shape| shape.bounds())
+        .reduce(|bounds, next| bounds.union(next))?;
+    if bounds.contains(point) {
+        canvas.selection.first().copied()
+    } else {
+        None
     }
 }

@@ -24,6 +24,8 @@ use crate::ui::QueuedAction;
 pub(super) struct ExtraState {
     /// Whether the pointer is over the window (hides the brush outline).
     pub(super) pointer_in_window: bool,
+    /// Keep a canvas mouse gesture until its release, including over UI panels.
+    pub(super) canvas_mouse_down: bool,
     /// Whether the window has keyboard focus; tablet pad controls are
     /// ignored while it doesn't.
     pub(super) focused: bool,
@@ -50,6 +52,7 @@ impl Default for ExtraState {
     fn default() -> Self {
         Self {
             pointer_in_window: false,
+            canvas_mouse_down: false,
             focused: true,
             brush_cursor_opacity: 1.0,
             queued_actions: VecDeque::new(),

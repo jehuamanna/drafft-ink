@@ -99,8 +99,13 @@ pub(super) fn intercept_mouse_button(state: &mut AppState, btn_state: ElementSta
     // A press outside the quick toolbars just closes them.
     if btn_state == ElementState::Pressed && state.ui_state.quick_bars.is_some() {
         state.ui_state.quick_bars = None;
-        state.extra.suppress_mouse_release = true;
         state.window.request_redraw();
+        // Selection gestures can begin with the same press that dismisses
+        // the floating controls; do not require an extra click before dragging.
+        if state.canvas.tool_manager.current_tool == ToolKind::Select {
+            return false;
+        }
+        state.extra.suppress_mouse_release = true;
         return true;
     }
     if btn_state == ElementState::Released

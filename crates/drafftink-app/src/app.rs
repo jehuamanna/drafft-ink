@@ -2326,8 +2326,7 @@ impl ApplicationHandler<UserEvent> for App {
         // Check both: if egui consumed the event OR if the pointer is over an egui area
         let egui_wants_input = egui_response.consumed
             || state.egui_ctx.is_pointer_over_area()
-            || state.egui_ctx.wants_pointer_input()
-            || state.egui_ctx.wants_keyboard_input();
+            || state.egui_ctx.wants_pointer_input();
 
         match event {
             WindowEvent::CloseRequested => {
@@ -4228,7 +4227,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
 
-            WindowEvent::Focused(focused) => state.extra.focused = focused,
+            WindowEvent::Focused(focused) => {
+                state.extra.focused = focused;
+                if !focused {
+                    state.extra.canvas_mouse_down = false;
+                }
+            }
 
             WindowEvent::CursorEntered { .. } => {
                 state.extra.pointer_in_window = true;
@@ -4245,7 +4249,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let point = Point::new(position.x, position.y);
 
                 // Skip canvas processing if egui wants the pointer
-                if egui_wants_input {
+                if egui_wants_input && !state.extra.canvas_mouse_down {
                     state.window.set_cursor(CursorIcon::Default);
                     state.needs_redraw = true;
                     state.window.request_redraw();
@@ -4397,8 +4401,9 @@ impl ApplicationHandler<UserEvent> for App {
                 button,
                 ..
             } => {
-                // Skip canvas processing if egui wants the pointer
-                if egui_wants_input {
+                // A gesture that started on the canvas owns movement and release,
+                // even when it crosses a toolbar. Keyboard focus is independent.
+                if egui_wants_input && !state.extra.canvas_mouse_down {
                     state.needs_redraw = true;
                     state.window.request_redraw();
                     return;
@@ -4416,6 +4421,9 @@ impl ApplicationHandler<UserEvent> for App {
                 };
 
                 let position = state.input.mouse_position();
+                if mouse_btn == MouseButton::Left {
+                    state.extra.canvas_mouse_down = btn_state == ElementState::Pressed;
+                }
 
                 match btn_state {
                     ElementState::Pressed => {
