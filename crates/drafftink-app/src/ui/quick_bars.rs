@@ -1,6 +1,9 @@
 //! Icon-only radial menu at the pointer.
 use super::*;
 
+// Arrange the radial palette by hue, followed by neutrals.
+const RING_COLORS: &[usize] = &[0, 1, 2, 4, 6, 7, 8, 10, 13, 14, 16, 17];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Selection,
@@ -191,7 +194,7 @@ pub(super) fn render_quick_bars(
                     UiAction::SetFillColor(None),
                 ));
             }
-            let colors = QUICK_COLORS
+            let colors = RING_COLORS
                 .iter()
                 .map(|&i| {
                     (
@@ -233,7 +236,13 @@ pub(super) fn render_quick_bars(
             }
         }
     }
-    let diameter = 272.0;
+    // Keep the expanded palette's click targets separated, including "No fill".
+    let color_page = matches!(bars.page, Page::Stroke | Page::Fill);
+    let (diameter, radius) = if color_page {
+        (312.0, 128.0)
+    } else {
+        (272.0, 105.0)
+    };
     let screen = ctx.content_rect();
     let top_left = Pos2::new(
         (anchor.x - diameter / 2.0)
@@ -257,19 +266,19 @@ pub(super) fn render_quick_bars(
             }
             ui.painter().circle_filled(
                 center,
-                132.0,
+                diameter / 2.0 - 4.0,
                 Color32::from_rgba_unmultiplied(248, 249, 252, 242),
             );
             ui.painter().circle_stroke(
                 center,
-                132.0,
+                diameter / 2.0 - 4.0,
                 Stroke::new(1.0_f32, Color32::from_gray(220)),
             );
             for (index, item) in items.iter().enumerate() {
                 if button(
                     ui,
                     ui.id().with(("item", index)),
-                    ring_position(center, 105.0, index, items.len()),
+                    ring_position(center, radius, index, items.len()),
                     36.0,
                     item,
                 ) {
