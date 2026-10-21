@@ -1583,7 +1583,12 @@ fn properties_contents(ui: &mut egui::Ui, props: &SelectedShapeProps) -> Option<
             }
             ui.small("Shift: constrain drag / scale evenly");
             ui.small("Arrow keys: move selection");
-            if ui.button("Delete selection").clicked() {
+            if IconButton::new(
+                include_image!("../assets/delete.svg"),
+                "Delete selection (Delete)",
+            )
+            .show(ui)
+            {
                 action = Some(UiAction::DeleteSelection);
             }
             ui.separator();

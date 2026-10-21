@@ -1,224 +1,401 @@
-//! Quick toolbars: tools, brushes and properties shown at the pointer.
-
+//! Icon-only radial menu at the pointer.
 use super::*;
 
-/// Tools and colours shown next to the pointer ([`Command::QuickToolbars`]).
-#[derive(Debug, Clone, Copy)]
-pub struct QuickBars {
-    /// Pointer position when opened, in screen points (set on the first frame).
-    pub anchor: Option<Pos2>,
-    /// When it opened, in egui time (seconds).
-    pub opened_at: f64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Selection,
+    Tools,
+    Stroke,
+    Fill,
+    Width,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct QuickBars {
+    pub anchor: Option<Pos2>,
+    pub opened_at: f64,
+    page: Page,
+}
 impl QuickBars {
     pub fn new(now: f64) -> Self {
         Self {
             anchor: None,
             opened_at: now,
+            page: Page::Tools,
         }
     }
 }
 
-/// Something picked from the quick toolbars.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum QuickItem {
-    Tool(ToolKind),
-    Color(Color32),
-    Fill(Option<Color32>),
-    Width(f32),
+struct Item {
+    icon: Option<ImageSource<'static>>,
+    color: Option<Color32>,
+    width: Option<f32>,
+    tooltip: String,
+    selected: bool,
+    action: UiAction,
 }
-
-impl QuickItem {
-    pub fn action(self) -> UiAction {
-        match self {
-            QuickItem::Tool(tool) => UiAction::SetTool(tool),
-            QuickItem::Color(color) => UiAction::SetStrokeColor(color),
-            QuickItem::Fill(color) => UiAction::SetFillColor(color),
-            QuickItem::Width(width) => UiAction::SetStrokeWidth(width),
+impl Item {
+    fn icon(icon: ImageSource<'static>, tooltip: &str, selected: bool, action: UiAction) -> Self {
+        Self {
+            icon: Some(icon),
+            color: None,
+            width: None,
+            tooltip: tooltip.into(),
+            selected,
+            action,
         }
     }
 }
 
-/// Render the quick toolbars around the pointer: tools in a column to its
-/// left, fill, stroke width and stroke colours above it, and the properties
-/// panel to its right, so everything is a short move away. The items most
-/// used sit nearest the pointer (the pen tools and the quick colours).
-/// Picking a tool closes them; style changes keep them open.
+fn ring_position(center: Pos2, radius: f32, index: usize, count: usize) -> Pos2 {
+    let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * index as f32 / count as f32;
+    center + Vec2::angled(angle) * radius
+}
+
+fn button(ui: &mut egui::Ui, id: egui::Id, center: Pos2, size: f32, item: &Item) -> bool {
+    let rect = egui::Rect::from_center_size(center, Vec2::splat(size));
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let fill = if item.selected {
+        Color32::from_rgb(219, 234, 254)
+    } else if response.hovered() {
+        Color32::from_gray(233)
+    } else {
+        Color32::from_rgb(253, 253, 255)
+    };
+    ui.painter().circle_filled(center, size / 2.0, fill);
+    ui.painter().circle_stroke(
+        center,
+        size / 2.0,
+        Stroke::new(
+            1.0_f32,
+            if item.selected {
+                Color32::from_rgb(59, 130, 246)
+            } else {
+                Color32::from_gray(212)
+            },
+        ),
+    );
+    let ink = if matches!(item.action, UiAction::DeleteSelection) {
+        Color32::from_rgb(190, 45, 55)
+    } else {
+        Color32::from_gray(55)
+    };
+    if let Some(icon) = &item.icon {
+        egui::Image::new(icon.clone()).tint(ink).paint_at(
+            ui,
+            egui::Rect::from_center_size(center, Vec2::splat(size * 0.52)),
+        );
+    } else if let Some(color) = item.color {
+        ui.painter().circle_filled(center, size * 0.27, color);
+        ui.painter().circle_stroke(
+            center,
+            size * 0.27,
+            Stroke::new(1.0_f32, Color32::from_gray(180)),
+        );
+    } else if let Some(width) = item.width {
+        ui.painter().line_segment(
+            [center - Vec2::new(9.0, 0.0), center + Vec2::new(9.0, 0.0)],
+            Stroke::new(width.min(8.0), ink),
+        );
+    }
+    let clicked = response.clicked();
+    response.on_hover_text(&item.tooltip);
+    clicked
+}
+
 pub(super) fn render_quick_bars(
     ctx: &Context,
-    ui_state: &mut UiState,
+    state: &mut UiState,
     props: &SelectedShapeProps,
 ) -> Option<UiAction> {
-    let mut bars = ui_state.quick_bars?;
-    let now = ctx.input(|i| i.time);
+    let mut bars = state.quick_bars?;
+    if bars.anchor.is_none() && props.has_selection {
+        bars.page = Page::Selection;
+    }
     let anchor = *bars.anchor.get_or_insert_with(|| {
         ctx.input(|i| i.pointer.hover_pos())
             .unwrap_or_else(|| ctx.content_rect().center())
     });
-
-    // Ease in over 120 ms: fade in while sliding out from the pointer.
-    let t = ((now - bars.opened_at) / 0.12).clamp(0.0, 1.0) as f32;
-    if t < 1.0 {
-        ctx.request_repaint();
-    }
-    let ease = 1.0 - (1.0 - t).powi(3);
-    let slide = (1.0 - ease) * 10.0;
-    const GAP: f32 = 14.0;
-
-    let mut action = None;
-
-    // Tools: two columns, the drawing tools in the column next to the pointer.
-    let tools = get_tools();
-    let near = [
-        ToolKind::Freehand,
-        ToolKind::Eraser,
-        ToolKind::Select,
-        ToolKind::Highlighter,
-        ToolKind::Text,
-        ToolKind::LaserPointer,
-    ];
-    let (inner, outer): (Vec<&Tool>, Vec<&Tool>) =
-        tools.iter().partition(|tool| near.contains(&tool.kind));
-    egui::Area::new(egui::Id::new("quick_tools"))
-        .order(egui::Order::Foreground)
-        .pivot(Align2::RIGHT_CENTER)
-        .fixed_pos(anchor + Vec2::new(-GAP + slide, 0.0))
-        .constrain(true)
-        .show(ctx, |ui| {
-            ui.set_opacity(ease);
-            panel_frame().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
-                    for column in [&outer, &inner] {
-                        ui.vertical(|ui| {
-                            for tool in column {
-                                let tooltip = ui_state
-                                    .keybindings
-                                    .with_hint(tool.label, Command::Tool(tool.kind));
-                                let response = ui.scope(|ui| {
-                                    IconButton::new(tool.icon.clone(), &tooltip)
-                                        .selected(ui_state.current_tool == tool.kind)
-                                        .tool()
-                                        .show(ui)
-                                });
-                                if response.inner {
-                                    action = Some(QuickItem::Tool(tool.kind));
-                                }
-                            }
-                        });
-                    }
-                });
-            });
-        });
-
-    // Colours: the quick colours plus black and white in the row nearest
-    // the pointer, the rest of the palette above.
-    let quick: Vec<(Color32, &str)> = QUICK_COLORS
-        .iter()
-        .map(|&i| (TAILWIND_COLORS[i].shades[6], TAILWIND_COLORS[i].name))
-        .chain([(Color32::BLACK, "Black"), (Color32::WHITE, "White")])
-        .collect();
-    let others: Vec<(Color32, &str)> = (0..TAILWIND_COLORS.len())
-        .filter(|i| !QUICK_COLORS.contains(i))
-        .map(|i| (TAILWIND_COLORS[i].shades[6], TAILWIND_COLORS[i].name))
-        .collect();
-    let mut rows: Vec<&[(Color32, &str)]> = others.chunks(quick.len()).collect();
-    rows.push(&quick);
-    let fills: Vec<(Color32, &str)> = QUICK_COLORS
-        .iter()
-        .map(|&i| (TAILWIND_COLORS[i].shades[1], TAILWIND_COLORS[i].name))
-        .chain(
-            QUICK_COLORS
+    let mut items = Vec::new();
+    match bars.page {
+        Page::Selection => {
+            items = vec![
+                Item::icon(
+                    include_image!("../../assets/pan.svg"),
+                    "Free movement",
+                    props.movement_axis == 0,
+                    UiAction::SetMovementAxis(0),
+                ),
+                Item::icon(
+                    include_image!("../../assets/move-x.svg"),
+                    "Horizontal movement",
+                    props.movement_axis == 1,
+                    UiAction::SetMovementAxis(1),
+                ),
+                Item::icon(
+                    include_image!("../../assets/move-y.svg"),
+                    "Vertical movement",
+                    props.movement_axis == 2,
+                    UiAction::SetMovementAxis(2),
+                ),
+                Item::icon(
+                    include_image!("../../assets/scale.svg"),
+                    "Proportional scale (Shift)",
+                    props.uniform_scale,
+                    UiAction::ToggleUniformScale,
+                ),
+                Item::icon(
+                    include_image!("../../assets/flip-h.svg"),
+                    "Flip horizontally",
+                    false,
+                    UiAction::FlipHorizontal,
+                ),
+                Item::icon(
+                    include_image!("../../assets/flip-v.svg"),
+                    "Flip vertically",
+                    false,
+                    UiAction::FlipVertical,
+                ),
+                Item::icon(
+                    include_image!("../../assets/duplicate.svg"),
+                    "Duplicate selection",
+                    false,
+                    UiAction::Duplicate,
+                ),
+                Item::icon(
+                    include_image!("../../assets/delete.svg"),
+                    "Delete selection (Delete)",
+                    false,
+                    UiAction::DeleteSelection,
+                ),
+            ];
+        }
+        Page::Tools => {
+            for tool in get_tools() {
+                items.push(Item::icon(
+                    tool.icon,
+                    &state
+                        .keybindings
+                        .with_hint(tool.label, Command::Tool(tool.kind)),
+                    state.current_tool == tool.kind,
+                    UiAction::SetTool(tool.kind),
+                ));
+            }
+        }
+        Page::Stroke | Page::Fill => {
+            if bars.page == Page::Fill {
+                items.push(Item::icon(
+                    include_image!("../../assets/no-fill.svg"),
+                    "No fill",
+                    state.fill_color.is_none(),
+                    UiAction::SetFillColor(None),
+                ));
+            }
+            let colors = QUICK_COLORS
                 .iter()
-                .map(|&i| (TAILWIND_COLORS[i].shades[6], TAILWIND_COLORS[i].name)),
-        )
-        .collect();
-    let section = |ui: &mut egui::Ui, text: &str| {
-        ui.label(
-            egui::RichText::new(text)
-                .size(10.0)
-                .color(Color32::from_gray(120)),
-        );
-    };
-    egui::Area::new(egui::Id::new("quick_colors"))
-        .order(egui::Order::Foreground)
-        .pivot(Align2::LEFT_BOTTOM)
-        .fixed_pos(anchor + Vec2::new(-GAP + 2.0, -GAP + slide))
-        .constrain(true)
-        .show(ctx, |ui| {
-            ui.set_opacity(ease);
-            panel_frame().show(ui, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(4.0, 4.0);
-                let mut item = |quick: QuickItem, clicked: bool| {
-                    if clicked {
-                        action = Some(quick);
-                    }
-                };
-
-                section(ui, "Fill");
-                ui.horizontal(|ui| {
-                    let response = ui.scope(|ui| {
-                        NoColorSwatch::new("No fill")
-                            .selected(ui_state.fill_color.is_none())
-                            .show(ui)
-                    });
-                    item(QuickItem::Fill(None), response.inner);
-                    for &(color, name) in &fills {
-                        let (clicked, _) = ColorSwatch::new(color, name)
-                            .selected(ui_state.fill_color == Some(color))
-                            .show(ui);
-                        item(QuickItem::Fill(Some(color)), clicked);
-                    }
+                .map(|&i| {
+                    (
+                        TAILWIND_COLORS[i].shades[if bars.page == Page::Fill { 1 } else { 6 }],
+                        TAILWIND_COLORS[i].name,
+                    )
+                })
+                .chain([(Color32::BLACK, "Black"), (Color32::WHITE, "White")]);
+            for (color, name) in colors {
+                let fill = bars.page == Page::Fill;
+                items.push(Item {
+                    icon: None,
+                    color: Some(color),
+                    width: None,
+                    tooltip: name.into(),
+                    selected: if fill {
+                        state.fill_color == Some(color)
+                    } else {
+                        state.stroke_color == color
+                    },
+                    action: if fill {
+                        UiAction::SetFillColor(Some(color))
+                    } else {
+                        UiAction::SetStrokeColor(color)
+                    },
                 });
-
-                section(ui, "Stroke width");
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(2.0, 0.0);
-                    for &(width, name) in STROKE_WIDTH_PRESETS.iter() {
-                        let tooltip = format!("{name} ({width} px)");
-                        let selected = (ui_state.stroke_width - width).abs() < 0.01;
-                        let response = ui
-                            .scope(|ui| StrokeWidthButton::new(width, &tooltip, selected).show(ui));
-                        item(QuickItem::Width(width), response.inner);
-                    }
+            }
+        }
+        Page::Width => {
+            for (width, name) in STROKE_WIDTH_PRESETS {
+                items.push(Item {
+                    icon: None,
+                    color: None,
+                    width: Some(width),
+                    tooltip: format!("{name} ({width} px)"),
+                    selected: (state.stroke_width - width).abs() < 0.01,
+                    action: UiAction::SetStrokeWidth(width),
                 });
-
-                section(ui, "Stroke");
-                for row in &rows {
-                    ui.horizontal(|ui| {
-                        for &(color, name) in *row {
-                            let (clicked, _) = ColorSwatch::new(color, name)
-                                .style(drafftink_widgets::ColorSwatchStyle::large())
-                                .selected(ui_state.stroke_color == color)
-                                .show(ui);
-                            item(QuickItem::Color(color), clicked);
-                        }
-                    });
-                }
-            });
-        });
-
-    // Properties of the selection or tool, to the right of the pointer.
-    let mut props_action = None;
-    if props.has_selection || props.is_drawing_tool {
-        egui::Area::new(egui::Id::new("quick_properties"))
-            .order(egui::Order::Foreground)
-            .pivot(Align2::LEFT_TOP)
-            .fixed_pos(anchor + Vec2::new(GAP - slide, -4.0))
-            .constrain(true)
-            .show(ctx, |ui| {
-                ui.set_opacity(ease);
-                panel_frame().show(ui, |ui| {
-                    ui.set_width(176.0);
-                    props_action = properties_contents(ui, props);
-                });
-            });
+            }
+        }
     }
+    let diameter = 272.0;
+    let screen = ctx.content_rect();
+    let top_left = Pos2::new(
+        (anchor.x - diameter / 2.0)
+            .clamp(screen.min.x, (screen.max.x - diameter).max(screen.min.x)),
+        (anchor.y - diameter / 2.0)
+            .clamp(screen.min.y, (screen.max.y - diameter).max(screen.min.y)),
+    );
+    let mut action = None;
+    let mut close = false;
+    egui::Area::new(egui::Id::new("quick_radial"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(top_left)
+        .movable(false)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(diameter), egui::Sense::hover());
+            let center = rect.center();
+            let t = ((ctx.input(|i| i.time) - bars.opened_at) / 0.12).clamp(0.0, 1.0) as f32;
+            ui.set_opacity(t);
+            if t < 1.0 {
+                ctx.request_repaint();
+            }
+            ui.painter().circle_filled(
+                center,
+                132.0,
+                Color32::from_rgba_unmultiplied(248, 249, 252, 242),
+            );
+            ui.painter().circle_stroke(
+                center,
+                132.0,
+                Stroke::new(1.0_f32, Color32::from_gray(220)),
+            );
+            for (index, item) in items.iter().enumerate() {
+                if button(
+                    ui,
+                    ui.id().with(("item", index)),
+                    ring_position(center, 105.0, index, items.len()),
+                    36.0,
+                    item,
+                ) {
+                    action = Some(item.action.clone());
+                }
+            }
+            let pages = [
+                (
+                    Page::Selection,
+                    include_image!("../../assets/select.svg"),
+                    "Selection",
+                ),
+                (
+                    Page::Tools,
+                    include_image!("../../assets/freehand.svg"),
+                    "Tools",
+                ),
+                (
+                    Page::Stroke,
+                    include_image!("../../assets/palette.svg"),
+                    "Stroke color",
+                ),
+                (
+                    Page::Fill,
+                    include_image!("../../assets/fill.svg"),
+                    "Fill color",
+                ),
+                (
+                    Page::Width,
+                    include_image!("../../assets/width.svg"),
+                    "Stroke width",
+                ),
+            ];
+            for (index, (page, icon, label)) in pages.into_iter().enumerate() {
+                if page == Page::Selection && !props.has_selection {
+                    continue;
+                }
+                let item = Item::icon(
+                    icon,
+                    label,
+                    bars.page == page,
+                    UiAction::SetTool(state.current_tool),
+                );
+                if button(
+                    ui,
+                    ui.id().with(("page", index)),
+                    ring_position(center, 47.0, index, 5),
+                    32.0,
+                    &item,
+                ) {
+                    bars.page = page;
+                }
+            }
+            let item = Item::icon(
+                include_image!("../../assets/close.svg"),
+                "Close (Esc)",
+                false,
+                UiAction::SetTool(state.current_tool),
+            );
+            close = button(ui, ui.id().with("close"), center, 24.0, &item);
+        });
+    let dismiss = close
+        || matches!(
+            action,
+            Some(UiAction::SetTool(_) | UiAction::DeleteSelection | UiAction::Duplicate)
+        );
+    state.quick_bars = if dismiss { None } else { Some(bars) };
+    action
+}
 
-    // Picking a tool closes the toolbars (you'll draw next); colours, widths
-    // and properties keep them open so several can be set in one go.
-    let picked_tool = matches!(action, Some(QuickItem::Tool(_)));
-    ui_state.quick_bars = if picked_tool { None } else { Some(bars) };
-    action.map(QuickItem::action).or(props_action)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radial_delete_click_dispatches_and_closes() {
+        let ctx = Context::default();
+        let mut state = UiState::default();
+        state.quick_bars = Some(QuickBars {
+            anchor: Some(Pos2::new(300.0, 300.0)),
+            opened_at: 0.0,
+            page: Page::Selection,
+        });
+        let props = SelectedShapeProps {
+            has_selection: true,
+            selection_count: 2,
+            ..Default::default()
+        };
+        let position = ring_position(Pos2::new(300.0, 300.0), 105.0, 7, 8);
+        let mut action = None;
+        for (time, events) in [
+            (1.0, vec![]),
+            (1.1, vec![]),
+            (
+                1.2,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            (
+                1.3,
+                vec![egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            ),
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, Vec2::splat(600.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                action = render_quick_bars(ctx, &mut state, &props);
+            });
+        }
+        assert_eq!(action, Some(UiAction::DeleteSelection));
+        assert!(state.quick_bars.is_none());
+    }
 }
