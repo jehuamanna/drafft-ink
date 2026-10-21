@@ -22,6 +22,8 @@ use crate::ui::QueuedAction;
 /// [`AppState`] fields for this fork's features, kept together so upstream
 /// changes to `AppState` merge cleanly.
 pub(super) struct ExtraState {
+    #[cfg(feature = "native")]
+    pub(super) autosave: super::autosave::Autosave,
     /// Whether the pointer is over the window (hides the brush outline).
     pub(super) pointer_in_window: bool,
     /// Keep a canvas mouse gesture until its release, including over UI panels.
@@ -51,6 +53,8 @@ pub(super) struct ExtraState {
 impl Default for ExtraState {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "native")]
+            autosave: super::autosave::Autosave::default(),
             pointer_in_window: false,
             canvas_mouse_down: false,
             focused: true,

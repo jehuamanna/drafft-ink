@@ -33,6 +33,8 @@ use crate::ui::{SelectedShapeProps, UiAction, UiState, render_ui, resolve_queued
 
 // This fork's features live in these modules, to keep upstream merges simple.
 mod actions;
+#[cfg(feature = "native")]
+mod autosave;
 mod commands;
 mod documents;
 mod extra;
@@ -2330,6 +2332,8 @@ impl ApplicationHandler<UserEvent> for App {
 
         match event {
             WindowEvent::CloseRequested => {
+                #[cfg(feature = "native")]
+                autosave::finish(state);
                 // Ask first if anything is unsaved.
                 if (0..state.tabs.len()).any(|i| tab_is_dirty(state, i)) {
                     state.ui_state.quit_prompt = true;
@@ -5065,6 +5069,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &mut self.state {
             state.input.end_step();
+            #[cfg(feature = "native")]
+            autosave::tick(state, _event_loop);
         }
     }
 }

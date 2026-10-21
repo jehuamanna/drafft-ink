@@ -39,12 +39,33 @@ pub fn read_document(path: &Path) -> Result<CanvasDocument, String> {
 /// Write a document to `path`. Writes a temporary file first and renames
 /// it over the old one, so a failed save never leaves a half-written file.
 pub fn write_document(document: &CanvasDocument, path: &Path) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
+
     let json = document.to_json().map_err(|e| e.to_string())?;
     let mut temp = path.as_os_str().to_owned();
-    temp.push(".saving");
+    temp.push(format!(
+        ".{}.{}.saving",
+        std::process::id(),
+        NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
+    ));
     let temp = PathBuf::from(temp);
-    std::fs::write(&temp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&temp, path).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| e.to_string())?;
+    let result = (|| {
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
     log::info!("Saved document to: {path:?}");
     Ok(())
 }
@@ -80,4 +101,44 @@ pub fn take_pending_saves() -> Vec<(u64, PathBuf, u64)> {
         .lock()
         .map(|mut saves| std::mem::take(&mut *saves))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_save_roundtrips_and_failed_replace_preserves_original() {
+        let root = std::env::temp_dir().join(format!(
+            "drafftink-save-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("drawing.json");
+        let document = CanvasDocument::new();
+        write_document(&document, &path).unwrap();
+        assert!(read_document(&path).unwrap().is_empty());
+        let original = std::fs::read(&path).unwrap();
+        // An invalid destination must fail without changing another document
+        // or leaving temporary files behind.
+        let blocked = root.join("blocked.json");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(write_document(&document, &blocked).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        // Dialog saves and autosaves may run concurrently. Each replacement
+        // must use its own temporary file and leave a complete document.
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| write_document(&document, &path).unwrap());
+            }
+        });
+        assert!(read_document(&path).unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -277,3 +277,16 @@ PRs welcome. Issues welcome. The code is right here.
 ## License
 
 **AGPLv3** - Use it, modify it, host it. Keep it open.
+
+### Automatic document saving
+
+On desktop, modified tabs save automatically after one second without edits,
+with a five-second maximum delay during continuous editing. Serialization and
+file writes run on a background thread; each save flushes a unique temporary
+file before replacing the document atomically. Idle documents cause no writes. New
+untitled documents receive a file in the platform's local data directory under
+`drafftink/documents` (normally `~/.local/share/drafftink/documents` on Linux).
+These documents reopen with the rest of your tabs on the next launch. Use
+**Save As** to choose another name or location. Failed saves leave the tab marked
+as modified and retry automatically; closing with pending edits still offers
+the existing save prompt.

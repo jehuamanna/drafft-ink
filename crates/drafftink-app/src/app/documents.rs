@@ -37,6 +37,8 @@ pub(super) fn tab_is_dirty(state: &AppState, index: usize) -> bool {
 
 /// Close a tab, first asking what to do with unsaved changes.
 pub(super) fn request_close_tab(state: &mut AppState, index: usize) {
+    #[cfg(feature = "native")]
+    super::autosave::finish(state);
     if index >= state.tabs.len() {
         return;
     }
@@ -83,6 +85,7 @@ pub(super) fn mark_saved(
 /// dialog save finishes later (see `file_ops::take_pending_saves`).
 #[cfg(feature = "native")]
 pub(super) fn save_tab(state: &mut AppState, index: usize, save_as: bool) -> bool {
+    super::autosave::finish(state);
     let Some(tab) = state.tabs.get(index) else {
         return false;
     };
