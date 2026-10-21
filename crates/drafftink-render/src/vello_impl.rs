@@ -1623,6 +1623,22 @@ impl Renderer for VelloRenderer {
         }
         batch.fill(&mut self.scene, camera_transform);
 
+        if ctx.canvas.selection.len() > 1 {
+            let group = Shape::Group(drafftink_core::shapes::Group::new(
+                ctx.canvas
+                    .selection
+                    .iter()
+                    .filter_map(|id| ctx.canvas.document.get_shape(*id).cloned())
+                    .collect(),
+            ));
+            self.render_selection_rect(group.bounds(), camera_transform);
+            for handle in get_handles(&group) {
+                if matches!(handle.kind, HandleKind::Corner(_)) {
+                    self.render_handle(&handle, camera_transform, 16.0 / self.zoom);
+                }
+            }
+        }
+
         // Draw preview shape if tool is active
         if let Some(preview) = ctx.canvas.tool_manager.preview_shape() {
             self.strokes.enabled = false;

@@ -2597,6 +2597,9 @@ impl ApplicationHandler<UserEvent> for App {
                     SelectedShapeProps::default()
                 };
 
+                selected_props.movement_axis = state.event_handler.movement_axis;
+                selected_props.uniform_scale = state.event_handler.uniform_scale;
+
                 // If a drawing tool is active (not Select/Pan/Text), show the panel
                 // for setting properties of shapes that will be created
                 use drafftink_core::tools::ToolKind;
@@ -3724,6 +3727,17 @@ impl ApplicationHandler<UserEvent> for App {
                                     state.canvas.tool_manager.pressure_simulation
                                 );
                             }
+                            UiAction::SetMovementAxis(axis) => {
+                                state.event_handler.movement_axis = axis
+                            }
+                            UiAction::ToggleUniformScale => {
+                                state.event_handler.uniform_scale =
+                                    !state.event_handler.uniform_scale
+                            }
+                            UiAction::DeleteSelection => {
+                                state.canvas.document.push_undo();
+                                state.canvas.delete_selected();
+                            }
                             UiAction::FlipHorizontal => {
                                 if !state.canvas.selection.is_empty() {
                                     state.canvas.document.push_undo();
@@ -4673,8 +4687,8 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // Skip canvas processing if egui wants keyboard
-                if egui_wants_input {
+                // Pointer hover over a toolbar must not swallow selection shortcuts.
+                if state.egui_ctx.wants_keyboard_input() {
                     state.needs_redraw = true;
                     state.window.request_redraw();
                     return;
@@ -4902,7 +4916,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let Some(command) = state.ui_state.keybindings.command_for(&chord) else {
                     return;
                 };
-                if !self.run_command(command, egui_wants_input) {
+                let keyboard_captured = state.egui_ctx.wants_keyboard_input();
+                if !self.run_command(command, keyboard_captured) {
                     return;
                 }
                 let Some(state) = &mut self.state else {

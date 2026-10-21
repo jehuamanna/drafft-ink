@@ -119,6 +119,9 @@ impl SelectionRect {
 pub struct EventHandler {
     /// Current manipulation state (when dragging a handle on a single shape).
     manipulation: Option<ManipulationState>,
+    aggregate_resize: Option<ManipulationState>,
+    pub movement_axis: u8,
+    pub uniform_scale: bool,
     /// Current multi-move state (when moving multiple selected shapes).
     multi_move: Option<MultiMoveState>,
     /// Selection rectangle for marquee selection.
@@ -167,6 +170,9 @@ impl EventHandler {
     pub fn new() -> Self {
         Self {
             manipulation: None,
+            aggregate_resize: None,
+            movement_axis: 0,
+            uniform_scale: false,
             multi_move: None,
             selection_rect: None,
             editing_text: None,
@@ -187,7 +193,7 @@ impl EventHandler {
 
     /// Check if a manipulation is in progress.
     pub fn is_manipulating(&self) -> bool {
-        self.manipulation.is_some() || self.multi_move.is_some()
+        self.manipulation.is_some() || self.multi_move.is_some() || self.aggregate_resize.is_some()
     }
 
     /// Check if a selection rectangle is active.
@@ -197,6 +203,9 @@ impl EventHandler {
 
     /// Cancel any ongoing operation.
     pub fn cancel(&mut self, canvas: &mut Canvas) {
+        if let Some(manip) = self.aggregate_resize.take() {
+            apply_aggregate(canvas, &manip.original_shape);
+        }
         // Restore original shapes if manipulating
         if let Some(manip) = self.manipulation.take() {
             if let Some(shape) = canvas.document.get_shape_mut(manip.shape_id) {
@@ -462,6 +471,29 @@ impl EventHandler {
                     }
                 }
 
+                if canvas.selection.len() > 1 {
+                    let group = Shape::Group(drafftink_core::shapes::Group::new(
+                        canvas
+                            .selection
+                            .iter()
+                            .filter_map(|id| canvas.document.get_shape(*id).cloned())
+                            .collect(),
+                    ));
+                    if let Some(handle @ HandleKind::Corner(_)) = hit_test_handles(
+                        &group,
+                        world_point,
+                        HANDLE_HIT_TOLERANCE / canvas.camera.zoom,
+                    ) {
+                        self.aggregate_resize = Some(ManipulationState::new(
+                            group.id(),
+                            Some(handle),
+                            world_point,
+                            group,
+                        ));
+                        return;
+                    }
+                }
+
                 // First, check if we clicked on a handle of a selected shape
                 let handle_tolerance = HANDLE_HIT_TOLERANCE / canvas.camera.zoom;
 
@@ -486,11 +518,26 @@ impl EventHandler {
                 let hits = canvas
                     .document
                     .shapes_at_point(world_point, 5.0 / canvas.camera.zoom);
-                if let Some(&id) = hits.first() {
+                let selected_hit = canvas.selection.iter().copied().find(|id| {
+                    canvas
+                        .document
+                        .get_shape(*id)
+                        .is_some_and(|shape| shape.bounds().contains(world_point))
+                });
+                if let Some(id) = selected_hit.or_else(|| hits.first().copied()) {
                     if input.shift() {
                         // Add to/toggle selection
                         if canvas.is_selected(id) {
-                            canvas.selection.retain(|&s| s != id);
+                            let remaining: Vec<_> = canvas
+                                .selection
+                                .iter()
+                                .copied()
+                                .filter(|&selected| selected != id)
+                                .collect();
+                            canvas.clear_selection();
+                            for selected in remaining {
+                                canvas.add_to_selection(selected);
+                            }
                         } else {
                             canvas.add_to_selection(id);
                         }
@@ -606,6 +653,20 @@ impl EventHandler {
         // Clear rotation state
         self.rotation_state = None;
 
+        if let Some(manip) = self.aggregate_resize.take() {
+            let result = apply_manipulation(
+                &manip.original_shape,
+                manip.handle,
+                manip.delta(),
+                input.shift() || self.uniform_scale,
+            );
+            apply_aggregate(canvas, &manip.original_shape);
+            if manip.delta().hypot() > 0.1 {
+                canvas.document.push_undo();
+                apply_aggregate(canvas, &result);
+            }
+            return;
+        }
         // If we were manipulating a single shape (handle resize), finalize it
         if let Some(manip) = self.manipulation.take() {
             // Check if this was a rotation operation
@@ -644,8 +705,12 @@ impl EventHandler {
                 }
                 // Now push undo and apply the final change
                 canvas.document.push_undo();
-                let new_shape =
-                    apply_manipulation(&manip.original_shape, manip.handle, delta, input.shift());
+                let new_shape = apply_manipulation(
+                    &manip.original_shape,
+                    manip.handle,
+                    delta,
+                    input.shift() || self.uniform_scale,
+                );
                 if let Some(shape) = canvas.document.get_shape_mut(manip.shape_id) {
                     *shape = new_shape;
                 }
@@ -870,6 +935,17 @@ impl EventHandler {
         smart_snap_enabled: bool,
         angle_snap_enabled: bool,
     ) {
+        if let Some(manip) = &mut self.aggregate_resize {
+            manip.current_point = world_point;
+            let result = apply_manipulation(
+                &manip.original_shape,
+                manip.handle,
+                manip.delta(),
+                input.shift() || self.uniform_scale,
+            );
+            apply_aggregate(canvas, &result);
+            return;
+        }
         // Clear previous snap
         self.last_snap = None;
         self.last_angle_snap = None;
@@ -1096,7 +1172,7 @@ impl EventHandler {
                 &manip.original_shape,
                 manip.handle,
                 adjusted_delta,
-                input.shift(),
+                input.shift() || self.uniform_scale,
             );
             if let Some(shape) = canvas.document.get_shape_mut(manip.shape_id) {
                 *shape = new_shape;
@@ -1171,6 +1247,19 @@ impl EventHandler {
                 raw_delta
             };
 
+            let mut snap_result = snap_result;
+            match self.movement_axis {
+                1 => snap_result.y = 0.0,
+                2 => snap_result.x = 0.0,
+                _ if input.shift() => {
+                    if raw_delta.x.abs() >= raw_delta.y.abs() {
+                        snap_result.y = 0.0;
+                    } else {
+                        snap_result.x = 0.0;
+                    }
+                }
+                _ => {}
+            }
             // Update current_point
             mm.current_point = Point::new(
                 mm.start_point.x + snap_result.x,
@@ -1330,5 +1419,135 @@ impl EventHandler {
 impl Default for EventHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn apply_aggregate(canvas: &mut Canvas, shape: &Shape) {
+    if let Shape::Group(group) = shape {
+        for child in &group.children {
+            if let Some(target) = canvas.document.get_shape_mut(child.id()) {
+                *target = child.clone();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use drafftink_core::shapes::{Group, Rectangle};
+
+    fn rectangle(x: f64) -> Shape {
+        Shape::Rectangle(Rectangle::new(Point::new(x, 0.0), 100.0, 100.0))
+    }
+
+    #[test]
+    fn selected_group_moves_from_empty_interior_with_axis_lock() {
+        let mut canvas = Canvas::new();
+        canvas.set_tool(ToolKind::Select);
+        let group = Shape::Group(Group::new(vec![rectangle(0.0), rectangle(200.0)]));
+        let id = group.id();
+        canvas.document.add_shape(group);
+        canvas.select(id);
+        let mut handler = EventHandler::new();
+        handler.movement_axis = 1;
+        let input = InputState::new();
+        handler.handle_press(&mut canvas, Point::new(150.0, 50.0), &input, false);
+        assert!(handler.is_manipulating());
+        handler.handle_drag(
+            &mut canvas,
+            Point::new(180.0, 90.0),
+            &input,
+            false,
+            false,
+            false,
+        );
+        let bounds = canvas.document.get_shape(id).unwrap().bounds();
+        assert_eq!(bounds.x0, 30.0);
+        assert_eq!(bounds.y0, 0.0);
+        handler.cancel(&mut canvas);
+        assert_eq!(canvas.document.get_shape(id).unwrap().bounds().x0, 0.0);
+        canvas.delete_selected();
+        assert!(canvas.document.get_shape(id).is_none());
+    }
+
+    #[test]
+    fn multi_selection_resizes_proportionally_and_can_cancel() {
+        let mut canvas = Canvas::new();
+        canvas.set_tool(ToolKind::Select);
+        for shape in [rectangle(0.0), rectangle(200.0)] {
+            let id = shape.id();
+            canvas.document.add_shape(shape);
+            canvas.add_to_selection(id);
+        }
+        let mut handler = EventHandler::new();
+        handler.uniform_scale = true;
+        let input = InputState::new();
+        handler.handle_press(&mut canvas, Point::new(300.0, 100.0), &input, false);
+        assert!(handler.aggregate_resize.is_some());
+        handler.handle_drag(
+            &mut canvas,
+            Point::new(600.0, 200.0),
+            &input,
+            false,
+            false,
+            false,
+        );
+        let first = canvas
+            .document
+            .get_shape(canvas.selection[0])
+            .unwrap()
+            .bounds();
+        assert_eq!(first.width(), 200.0);
+        assert_eq!(first.height(), 200.0);
+        handler.cancel(&mut canvas);
+        assert_eq!(
+            canvas
+                .document
+                .get_shape(canvas.selection[0])
+                .unwrap()
+                .bounds()
+                .width(),
+            100.0
+        );
+    }
+    #[test]
+    fn aggregate_resize_commits_one_undo_step() {
+        let mut canvas = Canvas::new();
+        canvas.set_tool(ToolKind::Select);
+        for shape in [rectangle(0.0), rectangle(200.0)] {
+            let id = shape.id();
+            canvas.document.add_shape(shape);
+            canvas.add_to_selection(id);
+        }
+        let mut handler = EventHandler::new();
+        let input = InputState::new();
+        handler.handle_press(&mut canvas, Point::new(300.0, 100.0), &input, false);
+        handler.handle_drag(
+            &mut canvas,
+            Point::new(600.0, 200.0),
+            &input,
+            false,
+            false,
+            false,
+        );
+        handler.handle_release(
+            &mut canvas,
+            Point::new(600.0, 200.0),
+            &input,
+            &ShapeStyle::default(),
+            false,
+            false,
+        );
+        let id = canvas.selection[0];
+        assert_eq!(
+            canvas.document.get_shape(id).unwrap().bounds().width(),
+            200.0
+        );
+        assert!(canvas.document.undo());
+        assert_eq!(
+            canvas.document.get_shape(id).unwrap().bounds().width(),
+            100.0
+        );
     }
 }

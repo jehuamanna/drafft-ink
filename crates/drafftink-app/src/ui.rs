@@ -52,6 +52,8 @@ use settings::render_settings;
 pub struct SelectedShapeProps {
     /// Is a single shape selected?
     pub has_selection: bool,
+    pub movement_axis: u8,
+    pub uniform_scale: bool,
     /// Number of selected shapes.
     pub selection_count: usize,
     /// Is the selected shape a text shape?
@@ -496,6 +498,9 @@ impl UiState {
 /// Actions that can be triggered by the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
+    SetMovementAxis(u8),
+    ToggleUniformScale,
+    DeleteSelection,
     /// Change the current tool.
     SetTool(ToolKind),
     /// Change stroke color.
@@ -1558,6 +1563,31 @@ fn properties_contents(ui: &mut egui::Ui, props: &SelectedShapeProps) -> Option<
         );
         ui.add_space(4.0);
 
+        if props.has_selection {
+            ui.label("Selection");
+            ui.horizontal(|ui| {
+                for (axis, label) in [(0, "Free"), (1, "Horizontal"), (2, "Vertical")] {
+                    if ui
+                        .selectable_label(props.movement_axis == axis, label)
+                        .clicked()
+                    {
+                        action = Some(UiAction::SetMovementAxis(axis));
+                    }
+                }
+            });
+            if ui
+                .selectable_label(props.uniform_scale, "Proportional scale")
+                .clicked()
+            {
+                action = Some(UiAction::ToggleUniformScale);
+            }
+            ui.small("Shift: constrain drag / scale evenly");
+            ui.small("Arrow keys: move selection");
+            if ui.button("Delete selection").clicked() {
+                action = Some(UiAction::DeleteSelection);
+            }
+            ui.separator();
+        }
         // Text-specific properties
         if props.is_text {
             // Font Family
